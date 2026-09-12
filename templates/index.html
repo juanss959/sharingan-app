@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sharingan - Recon</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0e14;--bg2:#111820;--bg3:#1a2130;--bg4:#222d3d;
+  --border:#1e2a3a;--border2:#2a3a4e;
+  --text:#d4dce8;--text2:#6b7f99;--text3:#4a5d75;
+  --accent:#00b4d8;--accent2:#0077b6;--accent-dim:rgba(0,180,216,.12);
+  --green:#00c853;--red:#ff3d57;--orange:#ff9f1c;--purple:#b388ff;
+  --cyan:#00e5ff;--yellow:#ffd600;
+  --sidebar:220px;
+}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+
+.app{display:flex;height:100vh}
+
+/* ── SIDEBAR ── */
+.sidebar{width:var(--sidebar);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+
+.sidebar-logo{padding:18px 16px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
+.sidebar-logo .eye{width:30px;height:30px;border-radius:50%;border:2px solid var(--red);display:flex;align-items:center;justify-content:center;font-size:13px;animation:spin 8s linear infinite}
+@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+.sidebar-logo h1{font-size:1rem;font-weight:700;letter-spacing:.5px}
+.sidebar-logo h1 span{color:var(--red)}
+
+.sidebar-input{padding:12px 12px 8px}
+.sidebar-input input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:.83rem;outline:none;transition:.2s}
+.sidebar-input input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.sidebar-input input::placeholder{color:var(--text3)}
+.sidebar-input .scan-btn{width:100%;margin-top:7px;background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border:none;border-radius:8px;padding:9px;font-size:.82rem;font-weight:600;cursor:pointer;transition:.2s;letter-spacing:.3px}
+.sidebar-input .scan-btn:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.sidebar-input .scan-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.sidebar-input .scan-btn.cancel{background:linear-gradient(135deg,#c62828,var(--red))}
+
+.sidebar-section{padding:10px 14px 4px;font-size:.6rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--text3);font-weight:600}
+
+.sidebar-nav{flex:1;overflow-y:auto;padding:4px 8px}
+.nav-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:.8rem;color:var(--text2);transition:.15s;position:relative;margin-bottom:1px;user-select:none}
+.nav-item:hover{background:var(--bg3);color:var(--text)}
+.nav-item.active{background:var(--accent-dim);color:var(--accent)}
+.nav-item .icon{font-size:.95rem;width:20px;text-align:center;flex-shrink:0}
+.nav-item .label{flex:1}
+.nav-item .badge{background:var(--bg4);color:var(--text2);font-size:.6rem;padding:1px 6px;border-radius:10px;min-width:16px;text-align:center}
+.nav-item.active .badge{background:var(--accent-dim);color:var(--accent)}
+.nav-item.disabled{opacity:.35;pointer-events:none}
+
+.sidebar-divider{height:1px;background:var(--border);margin:6px 14px}
+
+.sidebar-bottom{padding:8px 12px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:2px}
+.sidebar-bottom .nav-item{margin:0}
+
+/* ── CONTENT ── */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+.content-header{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0;min-height:52px}
+.content-header h2{font-size:.95rem;font-weight:600;display:flex;align-items:center;gap:10px}
+.content-header .domain-tag{background:var(--bg3);padding:3px 12px;border-radius:6px;font-weight:500;font-size:.88rem;color:var(--accent);font-family:monospace}
+.content-header .status{font-size:.7rem;padding:3px 10px;border-radius:12px;font-weight:600;text-transform:uppercase}
+.content-header .status.completed{background:rgba(0,200,83,.12);color:var(--green)}
+.content-header .status.running{background:var(--accent-dim);color:var(--accent);animation:pulse 1.5s infinite}
+.content-header .status.error{background:rgba(255,61,87,.12);color:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+
+.content-body{flex:1;padding:20px 24px;overflow-y:auto}
+
+/* ── WELCOME ── */
+.welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;text-align:center;gap:14px}
+.welcome .big-eye{width:70px;height:70px;border-radius:50%;border:3px solid var(--red);display:flex;align-items:center;justify-content:center;font-size:32px;opacity:.4;animation:spin 8s linear infinite}
+.welcome h2{font-size:1.1rem;color:var(--text);font-weight:600}
+.welcome p{color:var(--text2);font-size:.87rem;max-width:320px;line-height:1.5}
+
+/* ── PROGRESS ── */
+.progress-bar{display:flex;gap:5px;margin-bottom:16px}
+.progress-pill{flex:1;text-align:center;padding:8px 3px;border-radius:8px;font-size:.72rem;border:1px solid var(--border);background:var(--bg2);transition:.3s}
+.progress-pill.running{border-color:var(--accent);background:var(--accent-dim);animation:pulse 1.5s infinite}
+.progress-pill.done{border-color:var(--green);background:rgba(0,200,83,.08)}
+.progress-pill .p-num{font-weight:700;font-size:.82rem}
+.progress-pill .p-name{color:var(--text2);font-size:.6rem;margin-top:2px}
+
+.live-log{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;max-height:200px;overflow-y:auto;font-family:'Cascadia Code','Fira Code',monospace;font-size:.75rem;color:var(--text2)}
+.live-log .entry{padding:2px 0}
+.live-log .entry.phase{color:var(--accent);font-weight:600}
+
+/* ── INTEL CARDS ── */
+.intel-card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.intel-card-header{padding:11px 16px;background:var(--bg3);font-weight:600;font-size:.72rem;display:flex;align-items:center;gap:8px;text-transform:uppercase;letter-spacing:.5px;color:var(--text2)}
+.intel-card-header .icon{font-size:1rem}
+.intel-card-body{padding:4px 16px}
+.intel-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);font-size:.82rem;gap:16px}
+.intel-row:last-child{border:none}
+.intel-key{color:var(--text2);white-space:nowrap}
+.intel-val{color:var(--text);text-align:right;word-break:break-all;font-family:'Cascadia Code','Fira Code',monospace;font-size:.78rem}
+.intel-val.missing{color:var(--red)}
+.intel-val.present{color:var(--green)}
+.intel-val.warn{color:var(--orange)}
+
+/* ── TABLES ── */
+.data-table{width:100%;border-collapse:collapse;font-size:.82rem}
+.data-table th{text-align:left;padding:9px 12px;background:var(--bg3);color:var(--text2);font-weight:600;text-transform:uppercase;font-size:.68rem;letter-spacing:.5px;position:sticky;top:0}
+.data-table td{padding:8px 12px;border-bottom:1px solid var(--border)}
+.data-table tr:hover td{background:rgba(0,180,216,.03)}
+.table-wrap{border:1px solid var(--border);border-radius:10px;overflow:auto;max-height:500px}
+
+/* ── SUBDOMAIN CHIPS ── */
+.sub-list{display:flex;flex-wrap:wrap;gap:6px}
+.sub-chip{background:var(--bg3);border:1px solid var(--border);padding:5px 12px;border-radius:6px;font-size:.78rem;font-family:monospace;transition:.15s}
+.sub-chip:hover{border-color:var(--accent);background:var(--accent-dim)}
+.sub-chip .sub-src{color:var(--text3);font-size:.63rem;margin-left:4px}
+
+.filter-row{display:flex;gap:10px;margin-bottom:14px;align-items:center}
+.filter-row input{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:.83rem;outline:none;flex:1;max-width:280px;transition:.2s}
+.filter-row input:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.filter-row .count{color:var(--text2);font-size:.82rem}
+
+/* ── VULN CARDS ── */
+.vuln-cards{display:flex;flex-direction:column;gap:10px}
+.vuln-card{background:var(--bg2);border-left:4px solid var(--text3);border-radius:0 10px 10px 0;padding:12px 16px}
+.vuln-card.critical{border-left-color:var(--red)}
+.vuln-card.high{border-left-color:var(--orange)}
+.vuln-card.medium{border-left-color:var(--yellow)}
+.vuln-card.low{border-left-color:var(--cyan)}
+.vuln-card .vuln-header{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.vuln-card .sev{font-size:.68rem;padding:2px 7px;border-radius:4px;font-weight:700;text-transform:uppercase}
+.vuln-card .sev.critical{background:rgba(255,61,87,.15);color:var(--red)}
+.vuln-card .sev.high{background:rgba(255,159,28,.15);color:var(--orange)}
+.vuln-card .sev.medium{background:rgba(255,214,0,.15);color:var(--yellow)}
+.vuln-card .sev.low{background:rgba(0,229,255,.15);color:var(--cyan)}
+.vuln-card .sev.info,.vuln-card .sev.unknown{background:rgba(107,127,153,.15);color:var(--text2)}
+.vuln-card .vuln-name{font-weight:600;font-size:.88rem}
+.vuln-card .vuln-host{color:var(--text2);font-size:.82rem}
+.vuln-card .vuln-match{color:var(--text2);font-size:.78rem;margin-top:3px;word-break:break-all}
+
+/* ── URL SECTIONS ── */
+.url-section{margin-bottom:16px}
+.url-section h3{font-size:.88rem;margin-bottom:8px;color:var(--text2)}
+.url-list{max-height:300px;overflow:auto;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:8px}
+.url-item{padding:4px 10px;font-size:.78rem;word-break:break-all;border-bottom:1px solid var(--border)}
+.url-item:last-child{border:none}
+.url-item .src{color:var(--text3);font-size:.68rem;margin-left:6px}
+
+/* ── TOOLS ── */
+.tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.tool-item{display:flex;align-items:center;gap:8px;background:var(--bg2);border:1px solid var(--border);padding:10px 14px;border-radius:8px;font-size:.83rem}
+.tool-dot{width:8px;height:8px;border-radius:50%}
+.tool-dot.ok{background:var(--green)}
+.tool-dot.fail{background:var(--red)}
+
+/* ── HISTORY ── */
+.scan-list{display:flex;flex-direction:column;gap:8px}
+.scan-item{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;transition:.2s}
+.scan-item:hover{border-color:var(--accent);background:var(--bg3)}
+.scan-item .domain-name{font-size:.95rem;font-weight:600}
+.scan-item .scan-date{color:var(--text2);font-size:.75rem;margin-top:2px}
+.scan-item .stats-mini{display:flex;gap:10px;color:var(--text2);font-size:.75rem}
+.scan-item .delete-btn{background:none;border:none;color:var(--text3);cursor:pointer;padding:6px;border-radius:4px;font-size:.88rem;transition:.15s}
+.scan-item .delete-btn:hover{color:var(--red);background:rgba(255,61,87,.1)}
+
+.empty-state{text-align:center;padding:40px 20px;color:var(--text2)}
+.empty-state h3{margin-bottom:8px;color:var(--text)}
+
+.section-title{font-size:.92rem;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.section-title .icon{font-size:1.05rem}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- SIDEBAR -->
+  <div class="sidebar">
+    <div class="sidebar-logo">
+      <div class="eye">&#x25C9;</div>
+      <h1><span>S</span>haringan</h1>
+    </div>
+
+    <div class="sidebar-input">
+      <input type="text" id="domain-input" placeholder="target.com" onkeydown="if(event.key==='Enter')startScan()">
+      <button class="scan-btn" id="start-btn" onclick="startScan()">Iniciar Scan</button>
+    </div>
+
+    <div class="sidebar-section">Resultados</div>
+    <div class="sidebar-nav" id="modules-nav">
+      <div class="nav-item disabled" data-mod="overview" onclick="showModule('overview')">
+        <span class="icon">📊</span><span class="label">Resumen</span>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="nav-item disabled" data-mod="tech" onclick="showModule('tech')">
+        <span class="icon">🔧</span><span class="label">Tecnologias</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="whois" onclick="showModule('whois')">
+        <span class="icon">📋</span><span class="label">WHOIS</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="dns" onclick="showModule('dns')">
+        <span class="icon">🌐</span><span class="label">DNS</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="security" onclick="showModule('security')">
+        <span class="icon">🛡</span><span class="label">Sec. Headers</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="ssl" onclick="showModule('ssl')">
+        <span class="icon">🔒</span><span class="label">SSL/TLS</span><span class="badge">0</span>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="nav-item disabled" data-mod="subs" onclick="showModule('subs')">
+        <span class="icon">🌍</span><span class="label">Subdominios</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="hosts" onclick="showModule('hosts')">
+        <span class="icon">💻</span><span class="label">Hosts Vivos</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="ports" onclick="showModule('ports')">
+        <span class="icon">🔌</span><span class="label">Puertos</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="vulns" onclick="showModule('vulns')">
+        <span class="icon">⚡</span><span class="label">Vulnerabilidades</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="dirs" onclick="showModule('dirs')">
+        <span class="icon">📁</span><span class="label">Directorios</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="urls" onclick="showModule('urls')">
+        <span class="icon">🔗</span><span class="label">URLs</span><span class="badge">0</span>
+      </div>
+      <div class="sidebar-divider"></div>
+      <div class="nav-item disabled" data-mod="js_secrets" onclick="showModule('js_secrets')">
+        <span class="icon">🔑</span><span class="label">JS Secrets</span><span class="badge">0</span>
+      </div>
+    </div>
+
+    <div class="sidebar-bottom">
+      <div class="nav-item" data-mod="osint" onclick="showModule('osint')">
+        <span class="icon">🕵</span><span class="label">OSINT</span>
+      </div>
+      <div class="nav-item" data-mod="history" onclick="showModule('history')">
+        <span class="icon">📜</span><span class="label">Historial</span>
+      </div>
+      <div class="nav-item" data-mod="tools" onclick="showModule('tools')">
+        <span class="icon">⚙</span><span class="label">Herramientas</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTENT -->
+  <div class="content">
+    <div class="content-header" id="content-header">
+      <h2 id="header-title">Dashboard</h2>
+      <span id="header-status"></span>
+    </div>
+
+    <div class="content-body" id="content-body">
+      <div id="view-welcome" class="welcome">
+        <div class="big-eye">&#x25C9;</div>
+        <h2>Sharingan Recon</h2>
+        <p>Ingresa un dominio y haz click en Iniciar Scan. Luego selecciona un modulo del panel izquierdo para ver sus resultados.</p>
+      </div>
+
+      <div id="view-progress" style="display:none">
+        <div class="progress-bar" id="prog-phases"></div>
+        <div class="live-log" id="live-log"></div>
+      </div>
+
+      <div id="view-overview" style="display:none"></div>
+      <div id="view-tech" style="display:none"></div>
+      <div id="view-whois" style="display:none"></div>
+      <div id="view-dns" style="display:none"></div>
+      <div id="view-security" style="display:none"></div>
+      <div id="view-ssl" style="display:none"></div>
+      <div id="view-subs" style="display:none"></div>
+      <div id="view-hosts" style="display:none"></div>
+      <div id="view-ports" style="display:none"></div>
+      <div id="view-vulns" style="display:none"></div>
+      <div id="view-dirs" style="display:none"></div>
+      <div id="view-urls" style="display:none"></div>
+      <div id="view-js_secrets" style="display:none"></div>
+      <div id="view-osint" style="display:none"></div>
+      <div id="view-history" style="display:none"></div>
+      <div id="view-tools" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const socket = io();
+let currentScanId = null;
+let currentScanData = null;
+let activeModule = null;
+const phaseNames = ['','Recon Pasivo','Subdominios','Hosts Vivos','Port Scan','Vulnerabilidades','Directorios','URLs'];
+
+function hideAllViews() {
+  document.querySelectorAll('#content-body > div').forEach(d => d.style.display = 'none');
+}
+
+function setActiveNav(mod) {
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  if (mod) {
+    const el = document.querySelector(`.nav-item[data-mod="${mod}"]`);
+    if (el) el.classList.add('active');
+  }
+  activeModule = mod;
+}
+
+function enableModuleNav() {
+  document.querySelectorAll('#modules-nav .nav-item').forEach(n => n.classList.remove('disabled'));
+}
+
+function disableModuleNav() {
+  document.querySelectorAll('#modules-nav .nav-item').forEach(n => n.classList.add('disabled'));
+}
+
+function setHeader(title, statusHtml) {
+  document.getElementById('header-title').innerHTML = title;
+  document.getElementById('header-status').innerHTML = statusHtml || '';
+}
+
+function showModule(mod) {
+  hideAllViews();
+  setActiveNav(mod);
+
+  if (mod === 'history') {
+    document.getElementById('view-history').style.display = '';
+    setHeader('Historial de Scans', '');
+    loadHistory();
+    return;
+  }
+  if (mod === 'tools') {
+    document.getElementById('view-tools').style.display = '';
+    setHeader('Herramientas', '');
+    loadTools();
+    return;
+  }
+  if (mod === 'osint') {
+    document.getElementById('view-osint').style.display = '';
+    setHeader('OSINT Intelligence', '');
+    if (!document.getElementById('osint-domain')) initOsintView();
+    return;
+  }
+
+  if (!currentScanData) {
+    document.getElementById('view-welcome').style.display = '';
+    return;
+  }
+
+  const scan = currentScanData;
+  const domainH = `<span class="domain-tag">${esc(scan.domain)}</span>`;
+  const statusH = `<span class="status ${scan.status}">${scan.status}</span>`;
+
+  if (mod === 'overview') {
+    setHeader(domainH, statusH);
+    renderOverview(scan);
+  } else {
+    const titles = {tech:'Tecnologias',whois:'WHOIS',dns:'DNS Records',security:'Security Headers',ssl:'SSL/TLS',subs:'Subdominios',hosts:'Hosts Vivos',ports:'Puertos',vulns:'Vulnerabilidades',dirs:'Directorios',urls:'URLs',js_secrets:'JS Secrets'};
+    setHeader(titles[mod] || mod, statusH);
+  }
+  document.getElementById('view-' + mod).style.display = '';
+}
+
+// ── Start Scan ──
+function startScan() {
+  const domain = document.getElementById('domain-input').value.trim();
+  if (!domain) return;
+  document.getElementById('start-btn').disabled = true;
+  socket.emit('start_scan', { domain, phases: [1,2,3,4,5,6,7] });
+}
+
+socket.on('scan_started', data => {
+  currentScanId = data.scan_id;
+  currentScanData = null;
+  document.getElementById('live-log').innerHTML = '';
+
+  const pp = document.getElementById('prog-phases');
+  pp.innerHTML = '';
+  for (let p = 1; p <= 7; p++) {
+    const d = document.createElement('div');
+    d.className = 'progress-pill';
+    d.id = `pill-${p}`;
+    d.innerHTML = `<div class="p-num">${p}</div><div class="p-name">${phaseNames[p]}</div>`;
+    pp.appendChild(d);
+  }
+
+  setHeader(`<span class="domain-tag">${esc(data.domain)}</span>`, '<span class="status running">Escaneando...</span>');
+  const btn = document.getElementById('start-btn');
+  btn.textContent = 'Cancelar';
+  btn.className = 'scan-btn cancel';
+  btn.onclick = cancelScan;
+  btn.disabled = false;
+
+  disableModuleNav();
+  hideAllViews();
+  document.getElementById('view-progress').style.display = '';
+  setActiveNav(null);
+  addLog('Scan iniciado para ' + data.domain, true);
+});
+
+socket.on('phase_status', data => {
+  if (data.scan_id !== currentScanId) return;
+  const pill = document.getElementById(`pill-${data.phase}`);
+  if (pill) pill.className = 'progress-pill ' + data.status;
+  if (data.status === 'running') addLog(`Fase ${data.phase}: ${phaseNames[data.phase]} iniciada...`, true);
+  else if (data.status === 'done') addLog(`Fase ${data.phase}: ${phaseNames[data.phase]} completada`, true);
+});
+
+socket.on('scan_done', data => {
+  if (data.scan_id !== currentScanId) return;
+  addLog('Scan completado!', true);
+  resetScanBtn();
+  setTimeout(() => openDetail(data.scan_id), 800);
+});
+
+socket.on('scan_error', data => {
+  addLog('Error: ' + (data.error || 'desconocido'), true);
+  resetScanBtn();
+});
+
+socket.on('scan_cancelled', () => {
+  addLog('Scan cancelado', true);
+  resetScanBtn();
+});
+
+function cancelScan() {
+  if (currentScanId) socket.emit('cancel_scan', { scan_id: currentScanId });
+}
+
+function resetScanBtn() {
+  const btn = document.getElementById('start-btn');
+  btn.textContent = 'Iniciar Scan';
+  btn.className = 'scan-btn';
+  btn.onclick = startScan;
+  btn.disabled = false;
+}
+
+function addLog(msg, isPhase) {
+  const log = document.getElementById('live-log');
+  const div = document.createElement('div');
+  div.className = 'entry' + (isPhase ? ' phase' : '');
+  div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ── Open scan detail ──
+async function openDetail(id) {
+  const res = await fetch(`/api/scans/${id}`);
+  const scan = await res.json();
+  if (scan.error) return;
+  currentScanData = scan;
+  enableModuleNav();
+  updateBadges(scan);
+  renderAllModules(scan);
+  showModule('overview');
+}
+
+function updateBadges(scan) {
+  const info = scan.recon_info || {};
+  const counts = {
+    tech: (info.tech||[]).length,
+    whois: (info.whois||[]).length,
+    dns: (info.dns||[]).length,
+    security: (info.security||[]).length,
+    ssl: (info.ssl||[]).length,
+    subs: scan.subdomains.length,
+    hosts: scan.alive_hosts.length,
+    ports: scan.ports.length,
+    vulns: scan.vulns.length,
+    dirs: scan.directories.length,
+    urls: scan.urls.length,
+    js_secrets: (info.js_secrets||[]).filter(r => r.key !== 'JS Files Analizados').length,
+  };
+  Object.entries(counts).forEach(([mod, cnt]) => {
+    const item = document.querySelector(`.nav-item[data-mod="${mod}"] .badge`);
+    if (item) item.textContent = cnt;
+  });
+}
+
+function renderAllModules(scan) {
+  const info = scan.recon_info || {};
+  renderIntelView('tech', 'Tecnologias Detectadas', '🔧', info.tech);
+  renderIntelView('whois', 'WHOIS', '📋', info.whois);
+  renderIntelView('dns', 'DNS Records', '🌐', info.dns);
+  renderSecurityView(info.security);
+  renderSslView(info.ssl);
+  renderSubsView(scan.subdomains);
+  renderHostsView(scan.alive_hosts);
+  renderPortsView(scan.ports);
+  renderVulnsView(scan.vulns);
+  renderDirsView(scan.directories);
+  renderUrlsView(scan.urls);
+  renderJsSecretsView(info.js_secrets);
+}
+
+// ── Overview ──
+function renderOverview(scan) {
+  const info = scan.recon_info || {};
+  let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:10px;margin-bottom:20px">';
+  const stats = [
+    ['Tecnologias',(info.tech||[]).length,'var(--purple)'],
+    ['Subdominios',scan.subdomains.length,'var(--accent)'],
+    ['Hosts',scan.alive_hosts.length,'var(--green)'],
+    ['Puertos',scan.ports.length,'var(--orange)'],
+    ['Vulns',scan.vulns.length,'var(--red)'],
+    ['Dirs',scan.directories.length,'var(--cyan)'],
+    ['URLs',scan.urls.length,'var(--yellow)'],
+  ];
+  stats.forEach(([l,n,c]) => {
+    html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;text-align:center">
+      <div style="font-size:1.5rem;font-weight:700;color:${c}">${n}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase;margin-top:3px;letter-spacing:.5px">${l}</div></div>`;
+  });
+  html += '</div>';
+
+  if (info.tech && info.tech.length) {
+    html += '<div style="margin-bottom:16px"><div class="section-title"><span class="icon">🔧</span>Tecnologias</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    info.tech.forEach(t => { html += `<span style="background:var(--bg3);border:1px solid var(--border);padding:5px 12px;border-radius:6px;font-size:.8rem">${esc(t.key)}: <span style="color:var(--green)">${esc(t.value)}</span></span>`; });
+    html += '</div></div>';
+  }
+
+  document.getElementById('view-overview').innerHTML = html;
+}
+
+// ── Intel panels ──
+function renderIntelView(mod, title, icon, rows) {
+  const el = document.getElementById('view-' + mod);
+  if (!rows || !rows.length) {
+    el.innerHTML = `<div class="empty-state"><h3>Sin datos de ${title}</h3><p>No se encontraron resultados para este modulo.</p></div>`;
+    return;
+  }
+  let html = `<div class="intel-card"><div class="intel-card-header"><span class="icon">${icon}</span>${title}</div><div class="intel-card-body">`;
+  rows.forEach(r => {
+    let cls = '';
+    if (r.value === 'MISSING') cls = 'missing';
+    else if (mod === 'tech') cls = 'present';
+    html += `<div class="intel-row"><span class="intel-key">${esc(r.key)}</span><span class="intel-val ${cls}">${esc(r.value)}</span></div>`;
+  });
+  html += '</div></div>';
+  el.innerHTML = html;
+}
+
+function renderSecurityView(rows) {
+  const el = document.getElementById('view-security');
+  if (!rows || !rows.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin Security Headers</h3><p>No se encontraron headers de seguridad.</p></div>';
+    return;
+  }
+  let html = '<div class="intel-card"><div class="intel-card-header"><span class="icon">🛡</span>Security Headers</div><div class="intel-card-body">';
+  rows.forEach(r => {
+    const cls = r.value === 'MISSING' ? 'missing' : 'present';
+    html += `<div class="intel-row"><span class="intel-key">${esc(r.key)}</span><span class="intel-val ${cls}">${esc(r.value)}</span></div>`;
+  });
+  html += '</div></div>';
+  el.innerHTML = html;
+}
+
+function renderSslView(rows) {
+  const el = document.getElementById('view-ssl');
+  if (!rows || !rows.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin datos SSL/TLS</h3><p>No se encontro certificado SSL.</p></div>';
+    return;
+  }
+  let html = '<div class="intel-card"><div class="intel-card-header"><span class="icon">🔒</span>Certificado SSL/TLS</div><div class="intel-card-body">';
+  rows.forEach(r => {
+    html += `<div class="intel-row"><span class="intel-key">${esc(r.key)}</span><span class="intel-val present">${esc(r.value)}</span></div>`;
+  });
+  html += '</div></div>';
+  el.innerHTML = html;
+}
+
+function renderSubsView(subs) {
+  const el = document.getElementById('view-subs');
+  if (!subs.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin subdominios</h3><p>No se encontraron subdominios.</p></div>';
+    return;
+  }
+  el.innerHTML = `<div class="section-title"><span class="icon">🌍</span>Subdominios</div>
+    <div class="filter-row"><input type="text" placeholder="Filtrar..." oninput="filterSubs(this.value)"><span class="count">${subs.length} encontrados</span></div>
+    <div class="sub-list" id="sub-list">${subs.map(s => `<div class="sub-chip" data-sub="${esc(s.subdomain).toLowerCase()}">${esc(s.subdomain)}<span class="sub-src">${esc(s.source)}</span></div>`).join('')}</div>`;
+}
+
+function filterSubs(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('#sub-list .sub-chip').forEach(c => {
+    c.style.display = c.dataset.sub.includes(q) ? '' : 'none';
+  });
+}
+
+function renderHostsView(hosts) {
+  const el = document.getElementById('view-hosts');
+  if (!hosts.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin hosts vivos</h3><p>No se detectaron hosts activos.</p></div>';
+    return;
+  }
+  el.innerHTML = `<div class="section-title"><span class="icon">💻</span>Hosts Vivos (${hosts.length})</div>
+    <div class="table-wrap"><table class="data-table">
+    <thead><tr><th>URL</th><th>Status</th><th>Titulo</th><th>Servidor</th><th>Tech</th></tr></thead>
+    <tbody>${hosts.map(h => `<tr>
+      <td style="color:var(--accent);font-family:monospace;font-size:.8rem">${esc(h.url)}</td>
+      <td><span style="color:${h.status_code<400?'var(--green)':'var(--red)'}">${h.status_code||'-'}</span></td>
+      <td>${esc(h.title||'-')}</td>
+      <td style="color:var(--text2)">${esc(h.server||'-')}</td>
+      <td style="font-size:.78rem;color:var(--purple)">${esc(h.tech||'-')}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderPortsView(ports) {
+  const el = document.getElementById('view-ports');
+  if (!ports.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin puertos</h3><p>No se encontraron puertos abiertos.</p></div>';
+    return;
+  }
+  el.innerHTML = `<div class="section-title"><span class="icon">🔌</span>Puertos Abiertos (${ports.length})</div>
+    <div class="table-wrap"><table class="data-table">
+    <thead><tr><th>Host</th><th>Puerto</th><th>Estado</th><th>Servicio</th><th>Version</th></tr></thead>
+    <tbody>${ports.map(p => `<tr>
+      <td style="font-family:monospace;font-size:.8rem">${esc(p.host)}</td>
+      <td style="color:var(--accent);font-weight:600">${p.port}</td>
+      <td><span style="color:${p.state==='open'?'var(--green)':'var(--orange)'}">${esc(p.state)}</span></td>
+      <td>${esc(p.service)}</td>
+      <td style="color:var(--text2);font-size:.8rem">${esc(p.version||'-')}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderVulnsView(vulns) {
+  const el = document.getElementById('view-vulns');
+  if (!vulns.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin vulnerabilidades</h3><p>No se detectaron vulnerabilidades.</p></div>';
+    return;
+  }
+  const order = {critical:0,high:1,medium:2,low:3,info:4,unknown:5};
+  vulns.sort((a,b) => (order[a.severity]||5) - (order[b.severity]||5));
+  el.innerHTML = `<div class="section-title"><span class="icon">⚡</span>Vulnerabilidades (${vulns.length})</div>
+    <div class="vuln-cards">${vulns.map(v => `
+    <div class="vuln-card ${v.severity}">
+      <div class="vuln-header"><span class="sev ${v.severity}">${v.severity}</span><span class="vuln-name">${esc(v.info||v.template)}</span></div>
+      <div class="vuln-host">${esc(v.host)}</div>
+      ${v.matched_at ? `<div class="vuln-match">${esc(v.matched_at)}</div>` : ''}
+    </div>`).join('')}</div>`;
+}
+
+function renderDirsView(dirs) {
+  const el = document.getElementById('view-dirs');
+  if (!dirs.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin directorios</h3><p>No se encontraron directorios.</p></div>';
+    return;
+  }
+  el.innerHTML = `<div class="section-title"><span class="icon">📁</span>Directorios (${dirs.length})</div>
+    <div class="table-wrap"><table class="data-table">
+    <thead><tr><th>Host</th><th>Path</th><th>Status</th></tr></thead>
+    <tbody>${dirs.map(d => `<tr>
+      <td style="font-size:.8rem">${esc(d.host)}</td>
+      <td style="color:var(--accent);font-family:monospace;font-size:.8rem">${esc(d.path)}</td>
+      <td><span style="color:${d.status_code<400?'var(--green)':'var(--orange)'}">${d.status_code}</span></td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderUrlsView(urls) {
+  const el = document.getElementById('view-urls');
+  if (!urls.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin URLs</h3><p>No se encontraron URLs.</p></div>';
+    return;
+  }
+  const params = urls.filter(u => u.category === 'param');
+  const files = urls.filter(u => u.category === 'file');
+  const other = urls.filter(u => u.category === 'other');
+  let html = `<div class="section-title"><span class="icon">🔗</span>URLs (${urls.length})</div>`;
+  if (params.length) html += `<div class="url-section"><h3 style="color:var(--orange)">URLs con Parametros (${params.length})</h3><div class="url-list">${params.map(u => `<div class="url-item">${esc(u.url)}<span class="src">${esc(u.source)}</span></div>`).join('')}</div></div>`;
+  if (files.length) html += `<div class="url-section"><h3 style="color:var(--red)">Archivos Interesantes (${files.length})</h3><div class="url-list">${files.map(u => `<div class="url-item">${esc(u.url)}<span class="src">${esc(u.source)}</span></div>`).join('')}</div></div>`;
+  if (other.length) html += `<div class="url-section"><h3>Otras URLs (${other.length})</h3><div class="url-list">${other.map(u => `<div class="url-item">${esc(u.url)}<span class="src">${esc(u.source)}</span></div>`).join('')}</div></div>`;
+  el.innerHTML = html;
+}
+
+// ── JS Secrets ──
+function renderJsSecretsView(rows) {
+  const el = document.getElementById('view-js_secrets');
+  if (!rows || !rows.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin JS Secrets</h3><p>No se analizaron archivos JavaScript.</p></div>';
+    return;
+  }
+  const meta = rows.filter(r => r.key === 'JS Files Analizados');
+  const secrets = rows.filter(r => r.key !== 'JS Files Analizados');
+  let html = `<div class="section-title"><span class="icon">🔑</span>JS Secrets Analysis</div>`;
+  if (meta.length) html += `<div style="margin-bottom:16px;color:var(--text2);font-size:.82rem">${esc(meta[0].value)} archivos JS escaneados</div>`;
+  if (!secrets.length) {
+    html += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:20px;text-align:center;color:var(--green)">No se encontraron secretos expuestos</div>';
+  } else {
+    const severityOrder = {
+      'AWS Secret Key':0,'Stripe Secret':0,'Private Key':0,'JWT Token':1,
+      'AWS Access Key':1,'GitHub Token':1,'Bearer Token':1,'Slack Token':1,
+      'SendGrid API Key':1,'Twilio API Key':1,'Mailgun API Key':1,'Heroku API Key':1,
+      'Generic Secret':2,'Password in Code':2,'Generic API Key':2,'Google API Key':2,'Firebase API Key':2,
+      'Stripe Publishable':3,'Google OAuth':3,'MapBox Token':3,'Slack Webhook':3,
+      'Firebase URL':4,'S3 Bucket':4,'Azure Storage':4,
+      'Internal Endpoint':5,'Hardcoded Private IP':5
+    };
+    secrets.sort((a,b) => (severityOrder[a.key]??6) - (severityOrder[b.key]??6));
+    html += '<div style="display:flex;flex-direction:column;gap:8px">';
+    secrets.forEach(r => {
+      const sev = (severityOrder[r.key]??6) <= 1 ? 'critical' : (severityOrder[r.key]??6) <= 3 ? 'high' : 'medium';
+      const sevLabel = sev === 'critical' ? 'CRITICO' : sev === 'high' ? 'ALTO' : 'MEDIO';
+      const parts = r.value.split('  [en ');
+      const secretVal = parts[0] || r.value;
+      const fileName = parts[1] ? parts[1].replace(']','') : '';
+      html += `<div class="vuln-card ${sev}">
+        <div class="vuln-header"><span class="sev ${sev}">${sevLabel}</span><span class="vuln-name">${esc(r.key)}</span></div>
+        <div style="font-family:monospace;font-size:.78rem;color:var(--orange);word-break:break-all;margin-top:4px">${esc(secretVal)}</div>
+        ${fileName ? `<div style="color:var(--text3);font-size:.72rem;margin-top:3px">Archivo: ${esc(fileName)}</div>` : ''}
+      </div>`;
+    });
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+// ── OSINT (standalone tool) ──
+function initOsintView() {
+  const el = document.getElementById('view-osint');
+  el.innerHTML = `
+    <div class="section-title"><span class="icon">🕵</span>OSINT Intelligence</div>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <input id="osint-domain" type="text" placeholder="dominio.com" style="flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text1);font-size:.85rem;outline:none">
+      <button id="osint-btn" onclick="startOsint()" style="background:var(--purple);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-weight:600;cursor:pointer;font-size:.85rem">Analizar</button>
+    </div>
+    <div id="osint-status" style="display:none;margin-bottom:12px;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--accent);font-size:.82rem"></div>
+    <div id="osint-results"></div>
+  `;
+}
+
+function startOsint() {
+  const domain = document.getElementById('osint-domain').value.trim();
+  if (!domain) return;
+  document.getElementById('osint-btn').disabled = true;
+  document.getElementById('osint-btn').textContent = 'Analizando...';
+  document.getElementById('osint-results').innerHTML = '';
+  document.getElementById('osint-status').style.display = '';
+  document.getElementById('osint-status').textContent = 'Iniciando OSINT...';
+  socket.emit('start_osint', { domain });
+}
+
+socket.on('osint_status', data => {
+  const st = document.getElementById('osint-status');
+  if (st) { st.style.display = ''; st.textContent = data.msg; }
+  if (data.status === 'done') {
+    document.getElementById('osint-btn').disabled = false;
+    document.getElementById('osint-btn').textContent = 'Analizar';
+    setTimeout(() => { if (st) st.style.display = 'none'; }, 3000);
+  }
+});
+
+socket.on('osint_result', data => {
+  const el = document.getElementById('osint-results');
+  let html = '';
+
+  // Emails
+  html += `<div style="margin-bottom:20px">
+    <h3 style="color:var(--orange);margin-bottom:8px">📧 Emails Encontrados (${data.emails.length})</h3>`;
+  if (data.emails.length) {
+    html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    data.emails.forEach(e => {
+      html += `<span style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-family:monospace;font-size:.8rem;color:var(--accent)">${esc(e)}</span>`;
+    });
+    html += '</div>';
+  } else {
+    html += '<div style="color:var(--text3);font-size:.82rem">No se encontraron emails</div>';
+  }
+  html += '</div>';
+
+  // Social
+  if (data.social.length) {
+    html += `<div style="margin-bottom:20px">
+      <h3 style="color:var(--purple);margin-bottom:8px">🌐 Redes Sociales (${data.social.length})</h3>
+      <div style="display:flex;flex-direction:column;gap:5px">`;
+    const icons = {LinkedIn:'💼',Twitter:'🐦','Twitter/X':'🐦',GitHub:'🐙',Facebook:'📘',Instagram:'📸',YouTube:'🎬'};
+    data.social.forEach(s => {
+      html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;display:flex;align-items:center;gap:8px">
+        <span>${icons[s.platform]||'🔗'}</span>
+        <span style="color:var(--text2);font-size:.78rem;min-width:80px">${esc(s.platform)}</span>
+        <a href="${esc(s.url)}" target="_blank" style="color:var(--accent);font-size:.78rem;text-decoration:none;word-break:break-all">${esc(s.url)}</a>
+      </div>`;
+    });
+    html += '</div></div>';
+  }
+
+  // Metadata
+  if (data.meta.length) {
+    html += `<div style="margin-bottom:20px">
+      <h3 style="color:var(--green);margin-bottom:8px">🏷 Metadata (${data.meta.length})</h3>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">`;
+    data.meta.forEach(m => {
+      html += `<div style="display:flex;padding:8px 12px;border-bottom:1px solid var(--border)">
+        <span style="color:var(--text3);font-size:.78rem;min-width:140px">${esc(m.key)}</span>
+        <span style="color:var(--text1);font-size:.78rem;word-break:break-all">${esc(m.value)}</span>
+      </div>`;
+    });
+    html += '</div></div>';
+  }
+
+  // Wayback
+  html += `<div style="margin-bottom:20px">
+    <h3 style="color:var(--cyan,#06b6d4);margin-bottom:8px">⏳ Wayback Machine ${data.wayback_total ? '('+data.wayback_total+' URLs totales)' : ''}</h3>`;
+  if (data.wayback.length) {
+    html += '<div style="display:flex;flex-direction:column;gap:4px;max-height:300px;overflow-y:auto">';
+    data.wayback.forEach(w => {
+      html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:.75rem">
+        <a href="${esc(w.link)}" target="_blank" style="color:var(--accent);text-decoration:none;word-break:break-all">${esc(w.url)}</a>
+      </div>`;
+    });
+    html += '</div>';
+  } else {
+    html += '<div style="color:var(--text3);font-size:.82rem">No se encontraron URLs interesantes</div>';
+  }
+  html += '</div>';
+
+  // Google Dorks
+  html += `<div style="margin-bottom:20px">
+    <h3 style="color:var(--red);margin-bottom:8px">🔍 Google Dorks (${data.gdorks.length})</h3>
+    <div style="display:flex;flex-direction:column;gap:5px">`;
+  data.gdorks.forEach(d => {
+    html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="color:var(--text1);font-size:.82rem;font-weight:600">${esc(d.name)}</span>
+        <a href="${esc(d.link)}" target="_blank" style="background:var(--red);color:#fff;padding:2px 10px;border-radius:4px;font-size:.72rem;text-decoration:none">Buscar</a>
+      </div>
+      <div style="font-family:monospace;font-size:.72rem;color:var(--text3);margin-top:3px;word-break:break-all">${esc(d.query)}</div>
+    </div>`;
+  });
+  html += '</div></div>';
+
+  // GitHub Dorks
+  html += `<div style="margin-bottom:20px">
+    <h3 style="color:var(--text1);margin-bottom:8px">🐙 GitHub Dorks (${data.gitdorks.length})</h3>
+    <div style="display:flex;flex-direction:column;gap:5px">`;
+  data.gitdorks.forEach(d => {
+    html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="color:var(--text1);font-size:.82rem;font-weight:600">${esc(d.name)}</span>
+        <a href="${esc(d.link)}" target="_blank" style="background:#333;color:#fff;padding:2px 10px;border-radius:4px;font-size:.72rem;text-decoration:none">Buscar</a>
+      </div>
+      <div style="font-family:monospace;font-size:.72rem;color:var(--text3);margin-top:3px;word-break:break-all">${esc(d.query)}</div>
+    </div>`;
+  });
+  html += '</div></div>';
+
+  el.innerHTML = html;
+});
+
+// ── History ──
+async function loadHistory() {
+  const res = await fetch('/api/scans');
+  const scans = await res.json();
+  const el = document.getElementById('view-history');
+  if (!scans.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin scans todavia</h3><p>Inicia un reconocimiento para ver resultados.</p></div>';
+    return;
+  }
+  el.innerHTML = '<div class="scan-list">' + scans.map(s => `
+    <div class="scan-item" onclick="openDetail(${s.id})">
+      <div>
+        <div class="domain-name">${esc(s.domain)}</div>
+        <div class="scan-date">${formatDate(s.started_at)}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span class="status ${s.status}">${s.status}</span>
+        <div class="stats-mini">
+          <span>Sub:${s.subdomains}</span>
+          <span>Hosts:${s.alive}</span>
+          <span>Ports:${s.ports}</span>
+        </div>
+        <button class="delete-btn" onclick="event.stopPropagation();deleteScan(${s.id})" title="Eliminar">&#x2715;</button>
+      </div>
+    </div>`).join('') + '</div>';
+}
+
+async function deleteScan(id) {
+  if (!confirm('Eliminar este scan?')) return;
+  await fetch(`/api/scans/${id}`, { method: 'DELETE' });
+  loadHistory();
+}
+
+// ── Tools ──
+async function loadTools() {
+  const res = await fetch('/api/tools');
+  const tools = await res.json();
+  document.getElementById('view-tools').innerHTML = '<div class="tools-grid">' + Object.entries(tools).map(([name, ok]) =>
+    `<div class="tool-item"><div class="tool-dot ${ok?'ok':'fail'}"></div><span>${name}</span></div>`
+  ).join('') + '</div>';
+}
+
+// ── Util ──
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function formatDate(s) {
+  if (!s) return '';
+  try {
+    const d = new Date(s);
+    return d.toLocaleDateString('es') + ' ' + d.toLocaleTimeString('es', {hour:'2-digit',minute:'2-digit'});
+  } catch(e) { return s; }
+}
+</script>
+</body>
+</html>
