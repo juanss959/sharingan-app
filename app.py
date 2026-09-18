@@ -641,6 +641,227 @@ def handle_osint(data):
     threading.Thread(target=run_osint, args=(domain,), daemon=True).start()
 
 
+# ── User OSINT (username / email lookup) ──
+
+PLATFORM_CHECKS = [
+    {"name": "GitHub", "cat": "dev", "url": "https://api.github.com/users/{}", "icon": "🐙"},
+    {"name": "GitLab", "cat": "dev", "url": "https://gitlab.com/api/v4/users?username={}", "icon": "🦊", "json_list": True},
+    {"name": "Twitter/X", "cat": "social", "url": "https://x.com/{}", "icon": "🐦"},
+    {"name": "Instagram", "cat": "social", "url": "https://www.instagram.com/{}/", "icon": "📸"},
+    {"name": "TikTok", "cat": "social", "url": "https://www.tiktok.com/@{}", "icon": "🎵"},
+    {"name": "Reddit", "cat": "social", "url": "https://www.reddit.com/user/{}/about.json", "icon": "🤖", "json_check": True},
+    {"name": "Pinterest", "cat": "social", "url": "https://www.pinterest.com/{}/", "icon": "📌"},
+    {"name": "LinkedIn", "cat": "social", "url": "https://www.linkedin.com/in/{}/", "icon": "💼"},
+    {"name": "YouTube", "cat": "social", "url": "https://www.youtube.com/@{}", "icon": "🎬"},
+    {"name": "Twitch", "cat": "social", "url": "https://www.twitch.tv/{}", "icon": "🟣"},
+    {"name": "Steam", "cat": "gaming", "url": "https://steamcommunity.com/id/{}", "icon": "🎮"},
+    {"name": "Spotify", "cat": "social", "url": "https://open.spotify.com/user/{}", "icon": "🎧"},
+    {"name": "Medium", "cat": "blog", "url": "https://medium.com/@{}", "icon": "📝"},
+    {"name": "Dev.to", "cat": "dev", "url": "https://dev.to/api/users/by_username?url={}", "icon": "👨‍💻", "json_check": True},
+    {"name": "Keybase", "cat": "security", "url": "https://keybase.io/_/api/1.0/user/lookup.json?usernames={}", "icon": "🔐", "json_check": True},
+    {"name": "HackerOne", "cat": "security", "url": "https://hackerone.com/{}", "icon": "🛡"},
+    {"name": "Bugcrowd", "cat": "security", "url": "https://bugcrowd.com/{}", "icon": "🐛"},
+    {"name": "Docker Hub", "cat": "dev", "url": "https://hub.docker.com/v2/users/{}/", "icon": "🐳", "json_check": True},
+    {"name": "npm", "cat": "dev", "url": "https://www.npmjs.com/~{}", "icon": "📦"},
+    {"name": "PyPI", "cat": "dev", "url": "https://pypi.org/user/{}/", "icon": "🐍"},
+    {"name": "Gravatar", "cat": "social", "url": "https://en.gravatar.com/{}", "icon": "👤"},
+    {"name": "About.me", "cat": "social", "url": "https://about.me/{}", "icon": "🏠"},
+    {"name": "Flickr", "cat": "social", "url": "https://www.flickr.com/people/{}/", "icon": "📷"},
+    {"name": "SoundCloud", "cat": "social", "url": "https://soundcloud.com/{}", "icon": "🔊"},
+    {"name": "Patreon", "cat": "social", "url": "https://www.patreon.com/{}", "icon": "💰"},
+    {"name": "Bitbucket", "cat": "dev", "url": "https://bitbucket.org/api/2.0/users/{}", "icon": "🪣", "json_check": True},
+    {"name": "Replit", "cat": "dev", "url": "https://replit.com/@{}", "icon": "💻"},
+    {"name": "Stack Overflow", "cat": "dev", "url": "https://stackoverflow.com/users/?tab=accounts&SearchOn=DisplayName&Search={}", "icon": "📚"},
+    {"name": "Telegram", "cat": "social", "url": "https://t.me/{}", "icon": "✈"},
+    {"name": "VK", "cat": "social", "url": "https://vk.com/{}", "icon": "🔵"},
+    {"name": "Mastodon (mastodon.social)", "cat": "social", "url": "https://mastodon.social/@{}", "icon": "🐘"},
+    {"name": "Fiverr", "cat": "social", "url": "https://www.fiverr.com/{}", "icon": "🟢"},
+    {"name": "Scribd", "cat": "social", "url": "https://www.scribd.com/{}", "icon": "📖"},
+    {"name": "SlideShare", "cat": "social", "url": "https://www.slideshare.net/{}", "icon": "📊"},
+    {"name": "Trello", "cat": "social", "url": "https://trello.com/{}", "icon": "📋"},
+]
+
+EMAIL_SERVICES = [
+    {"name": "Gravatar", "url": "https://en.gravatar.com/{}.json", "icon": "👤"},
+    {"name": "GitHub (email)", "url": "https://api.github.com/search/users?q={}+in:email", "icon": "🐙", "json_check": True},
+    {"name": "Have I Been Pwned", "url": "https://haveibeenpwned.com/unifiedsearch/{}", "icon": "🔓"},
+]
+
+
+def _check_platform(platform, username, results_list, session):
+    url = platform["url"].format(username)
+    try:
+        resp = session.get(url, timeout=8, allow_redirects=True)
+        found = False
+
+        if platform.get("json_list"):
+            try:
+                data = resp.json()
+                found = isinstance(data, list) and len(data) > 0
+            except Exception:
+                pass
+        elif platform.get("json_check"):
+            found = resp.status_code == 200
+            try:
+                resp.json()
+            except Exception:
+                found = False
+        else:
+            found = resp.status_code == 200
+            if found:
+                not_found_signals = [
+                    "page not found", "user not found", "this page isn",
+                    "doesn't exist", "404", "sorry, this page",
+                    "this account doesn", "couldn't find", "no results",
+                    "not exist", "pagina no encontrada",
+                ]
+                body_lower = resp.text[:5000].lower()
+                title_match = re.search(r'<title[^>]*>([^<]+)</title>', body_lower)
+                check_text = (title_match.group(1) if title_match else "") + body_lower[:2000]
+                if any(sig in check_text for sig in not_found_signals):
+                    found = False
+
+        if found:
+            result = {
+                "platform": platform["name"],
+                "url": url,
+                "icon": platform["icon"],
+                "cat": platform.get("cat", "other"),
+            }
+            if platform["name"] == "GitHub" and resp.status_code == 200:
+                try:
+                    gh = resp.json()
+                    result["extra"] = {
+                        "name": gh.get("name", ""),
+                        "bio": gh.get("bio", ""),
+                        "location": gh.get("location", ""),
+                        "company": gh.get("company", ""),
+                        "repos": gh.get("public_repos", 0),
+                        "followers": gh.get("followers", 0),
+                        "avatar": gh.get("avatar_url", ""),
+                        "created": gh.get("created_at", "")[:10],
+                    }
+                except Exception:
+                    pass
+            results_list.append(result)
+    except Exception:
+        pass
+
+
+def run_user_osint(query, mode):
+    results = {"query": query, "mode": mode, "found": [], "breaches": [], "emails_from_username": [],
+               "dorks": [], "total_checked": 0}
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+    if mode == "username":
+        socketio.emit("user_osint_status", {"status": "running", "msg": f"Buscando '{query}' en {len(PLATFORM_CHECKS)} plataformas..."})
+
+        threads = []
+        found_list = []
+        for plat in PLATFORM_CHECKS:
+            t = threading.Thread(target=_check_platform, args=(plat, query, found_list, session), daemon=True)
+            threads.append(t)
+            t.start()
+
+        for i, t in enumerate(threads):
+            t.join(timeout=12)
+            if (i + 1) % 10 == 0 or i == len(threads) - 1:
+                socketio.emit("user_osint_status", {
+                    "status": "running",
+                    "msg": f"Verificadas {i + 1}/{len(PLATFORM_CHECKS)} plataformas... ({len(found_list)} encontradas)"
+                })
+
+        results["found"] = sorted(found_list, key=lambda x: x["platform"])
+        results["total_checked"] = len(PLATFORM_CHECKS)
+
+        socketio.emit("user_osint_status", {"status": "running", "msg": "Generando dorks de usuario..."})
+        user_dorks = [
+            ("Email en Google", f'"{query}" "@gmail.com" OR "@hotmail.com" OR "@yahoo.com" OR "@outlook.com"'),
+            ("Perfiles publicos", f'"{query}" site:linkedin.com OR site:facebook.com OR site:twitter.com OR site:instagram.com'),
+            ("Documentos", f'"{query}" filetype:pdf OR filetype:doc OR filetype:xls'),
+            ("Foros", f'"{query}" site:reddit.com OR site:stackoverflow.com OR site:quora.com'),
+            ("Pastes", f'"{query}" site:pastebin.com OR site:ghostbin.com OR site:paste.ee'),
+            ("Leaks / Dumps", f'"{query}" password OR leaked OR dump OR breach'),
+            ("CV / Resume", f'"{query}" resume OR curriculum OR "curriculum vitae" filetype:pdf'),
+            ("Code Repos", f'"{query}" site:github.com OR site:gitlab.com OR site:bitbucket.org'),
+        ]
+        for name, q in user_dorks:
+            results["dorks"].append({"name": name, "query": q, "link": f"https://www.google.com/search?q={requests.utils.quote(q)}"})
+
+    elif mode == "email":
+        socketio.emit("user_osint_status", {"status": "running", "msg": f"Analizando email: {query}"})
+
+        email_local = query.split("@")[0] if "@" in query else query
+        email_domain = query.split("@")[1] if "@" in query else ""
+
+        socketio.emit("user_osint_status", {"status": "running", "msg": "Buscando username en plataformas..."})
+        threads = []
+        found_list = []
+        for plat in PLATFORM_CHECKS:
+            t = threading.Thread(target=_check_platform, args=(plat, email_local, found_list, session), daemon=True)
+            threads.append(t)
+            t.start()
+        for i, t in enumerate(threads):
+            t.join(timeout=12)
+            if (i + 1) % 10 == 0 or i == len(threads) - 1:
+                socketio.emit("user_osint_status", {
+                    "status": "running",
+                    "msg": f"Verificadas {i + 1}/{len(PLATFORM_CHECKS)} plataformas... ({len(found_list)} encontradas)"
+                })
+        results["found"] = sorted(found_list, key=lambda x: x["platform"])
+        results["total_checked"] = len(PLATFORM_CHECKS)
+
+        socketio.emit("user_osint_status", {"status": "running", "msg": "Buscando breaches conocidos..."})
+        try:
+            hibp_resp = session.get(f"https://haveibeenpwned.com/unifiedsearch/{query}", timeout=10,
+                                    headers={"User-Agent": "Sharingan-OSINT"})
+            if hibp_resp.status_code == 200:
+                try:
+                    hibp = hibp_resp.json()
+                    for b in hibp.get("Breaches", []):
+                        results["breaches"].append({
+                            "name": b.get("Name", ""),
+                            "domain": b.get("Domain", ""),
+                            "date": b.get("BreachDate", ""),
+                            "count": b.get("PwnCount", 0),
+                            "data": ", ".join(b.get("DataClasses", [])[:5]),
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        socketio.emit("user_osint_status", {"status": "running", "msg": "Generando dorks de email..."})
+        email_dorks = [
+            ("Menciones del email", f'"{query}"'),
+            ("Registros publicos", f'"{query}" site:linkedin.com OR site:facebook.com'),
+            ("Documentos con email", f'"{query}" filetype:pdf OR filetype:doc OR filetype:xls'),
+            ("Pastes con email", f'"{query}" site:pastebin.com OR site:ghostbin.com'),
+            ("Leaks / Breaches", f'"{query}" leaked OR breach OR dump OR password'),
+            ("Foros", f'"{query}" site:reddit.com OR site:stackoverflow.com OR site:quora.com'),
+            ("Code con email", f'"{query}" site:github.com OR site:gitlab.com'),
+            ("Listas publicas", f'"{query}" list OR mailing OR newsletter OR subscriber'),
+        ]
+        if email_domain:
+            email_dorks.append(("Otros emails del dominio", f'"@{email_domain}" -"{query}"'))
+        for name, q in email_dorks:
+            results["dorks"].append({"name": name, "query": q, "link": f"https://www.google.com/search?q={requests.utils.quote(q)}"})
+
+    socketio.emit("user_osint_result", results)
+    socketio.emit("user_osint_status", {"status": "done", "msg": "Busqueda completada"})
+
+
+@socketio.on("start_user_osint")
+def handle_user_osint(data):
+    query = data.get("query", "").strip()
+    mode = data.get("mode", "username")
+    if not query:
+        return
+    threading.Thread(target=run_user_osint, args=(query, mode), daemon=True).start()
+
+
 # ── Standalone Fuzzing ──
 
 BUILTIN_WORDLIST = [

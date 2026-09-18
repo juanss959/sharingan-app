@@ -240,6 +240,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div class="nav-item" data-mod="osint" onclick="showModule('osint')">
         <span class="icon">🕵</span><span class="label">OSINT</span>
       </div>
+      <div class="nav-item" data-mod="user_osint" onclick="showModule('user_osint')">
+        <span class="icon">👤</span><span class="label">User OSINT</span>
+      </div>
       <div class="nav-item" data-mod="history" onclick="showModule('history')">
         <span class="icon">📜</span><span class="label">Historial</span>
       </div>
@@ -283,6 +286,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div id="view-js_secrets" style="display:none"></div>
       <div id="view-fuzzing" style="display:none"></div>
       <div id="view-osint" style="display:none"></div>
+      <div id="view-user_osint" style="display:none"></div>
       <div id="view-history" style="display:none"></div>
       <div id="view-tools" style="display:none"></div>
     </div>
@@ -348,6 +352,12 @@ function showModule(mod) {
     document.getElementById('view-osint').style.display = '';
     setHeader('OSINT Intelligence', '');
     if (!document.getElementById('osint-domain')) initOsintView();
+    return;
+  }
+  if (mod === 'user_osint') {
+    document.getElementById('view-user_osint').style.display = '';
+    setHeader('👤 User OSINT', '');
+    if (!document.getElementById('uosint-query')) initUserOsintView();
     return;
   }
 
@@ -853,6 +863,160 @@ socket.on('osint_result', data => {
     </div>`;
   });
   html += '</div></div>';
+
+  el.innerHTML = html;
+});
+
+// ── User OSINT (username / email lookup) ──
+function initUserOsintView() {
+  const el = document.getElementById('view-user_osint');
+  el.innerHTML = `
+    <div class="section-title"><span class="icon">👤</span>User OSINT - Busqueda de Usuarios</div>
+    <div style="margin-bottom:12px;color:var(--text3);font-size:.8rem">Busca un username o email en +35 plataformas para encontrar donde esta registrado.</div>
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <select id="uosint-mode" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text1);font-size:.85rem;outline:none;cursor:pointer">
+        <option value="username">🔎 Username</option>
+        <option value="email">📧 Email</option>
+      </select>
+      <input id="uosint-query" type="text" placeholder="johndoe" style="flex:1;min-width:200px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text1);font-size:.85rem;outline:none">
+      <button id="uosint-btn" onclick="startUserOsint()" style="background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-weight:600;cursor:pointer;font-size:.85rem">Investigar</button>
+    </div>
+    <div id="uosint-status" style="display:none;margin-bottom:12px;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--accent);font-size:.82rem"></div>
+    <div id="uosint-results"></div>
+  `;
+  document.getElementById('uosint-mode').addEventListener('change', function() {
+    const q = document.getElementById('uosint-query');
+    q.placeholder = this.value === 'email' ? 'usuario@gmail.com' : 'johndoe';
+  });
+}
+
+function startUserOsint() {
+  const query = document.getElementById('uosint-query').value.trim();
+  const mode = document.getElementById('uosint-mode').value;
+  if (!query) return;
+  document.getElementById('uosint-btn').disabled = true;
+  document.getElementById('uosint-btn').textContent = 'Investigando...';
+  document.getElementById('uosint-results').innerHTML = '';
+  document.getElementById('uosint-status').style.display = '';
+  document.getElementById('uosint-status').textContent = 'Iniciando busqueda...';
+  socket.emit('start_user_osint', { query, mode });
+}
+
+socket.on('user_osint_status', data => {
+  const st = document.getElementById('uosint-status');
+  if (st) { st.style.display = ''; st.textContent = data.msg; }
+  if (data.status === 'done') {
+    document.getElementById('uosint-btn').disabled = false;
+    document.getElementById('uosint-btn').textContent = 'Investigar';
+    setTimeout(() => { if (st) st.style.display = 'none'; }, 4000);
+  }
+});
+
+socket.on('user_osint_result', data => {
+  const el = document.getElementById('uosint-results');
+  let html = '';
+
+  // Stats bar
+  const cats = {};
+  data.found.forEach(f => { cats[f.cat] = (cats[f.cat] || 0) + 1; });
+  html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
+    <div style="background:linear-gradient(135deg,#7c3aed,#a855f7);border-radius:10px;padding:12px 18px;flex:1;min-width:140px">
+      <div style="font-size:1.6rem;font-weight:700;color:#fff">${data.found.length}</div>
+      <div style="font-size:.75rem;color:rgba(255,255,255,.8)">Cuentas encontradas</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 18px;flex:1;min-width:140px">
+      <div style="font-size:1.6rem;font-weight:700;color:var(--text1)">${data.total_checked}</div>
+      <div style="font-size:.75rem;color:var(--text3)">Plataformas verificadas</div>
+    </div>`;
+  if (data.breaches && data.breaches.length) {
+    html += `<div style="background:linear-gradient(135deg,#dc2626,#ef4444);border-radius:10px;padding:12px 18px;flex:1;min-width:140px">
+      <div style="font-size:1.6rem;font-weight:700;color:#fff">${data.breaches.length}</div>
+      <div style="font-size:.75rem;color:rgba(255,255,255,.8)">Breaches detectados</div>
+    </div>`;
+  }
+  html += '</div>';
+
+  // Platforms found by category
+  if (data.found.length) {
+    const catNames = {social:'Redes Sociales',dev:'Desarrollo',gaming:'Gaming',security:'Seguridad',blog:'Blogs',other:'Otros'};
+    const catColors = {social:'#a855f7',dev:'#3b82f6',gaming:'#22c55e',security:'#ef4444',blog:'#f59e0b',other:'#6b7280'};
+    const grouped = {};
+    data.found.forEach(f => {
+      const c = f.cat || 'other';
+      if (!grouped[c]) grouped[c] = [];
+      grouped[c].push(f);
+    });
+    for (const [cat, items] of Object.entries(grouped)) {
+      html += `<div style="margin-bottom:16px">
+        <h3 style="color:${catColors[cat]||'var(--text1)'};margin-bottom:8px;font-size:.9rem">${items[0].icon || '🔗'} ${catNames[cat]||cat} (${items.length})</h3>
+        <div style="display:flex;flex-direction:column;gap:5px">`;
+      items.forEach(f => {
+        html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px;transition:border-color .2s" onmouseover="this.style.borderColor='${catColors[cat]||'var(--accent)'}'" onmouseout="this.style.borderColor='var(--border)'">
+          <span style="font-size:1.2rem">${f.icon||'🔗'}</span>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="color:var(--text1);font-weight:600;font-size:.85rem">${esc(f.platform)}</span>
+              <span style="background:${catColors[cat]||'#6b7280'}22;color:${catColors[cat]||'#6b7280'};font-size:.65rem;padding:2px 8px;border-radius:4px">${catNames[cat]||cat}</span>
+            </div>
+            <a href="${esc(f.url)}" target="_blank" style="color:var(--accent);font-size:.75rem;text-decoration:none;word-break:break-all">${esc(f.url)}</a>`;
+        if (f.extra) {
+          const e = f.extra;
+          html += `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">`;
+          if (e.name) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">👤 ${esc(e.name)}</span>`;
+          if (e.location) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">📍 ${esc(e.location)}</span>`;
+          if (e.company) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">🏢 ${esc(e.company)}</span>`;
+          if (e.repos) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">📦 ${e.repos} repos</span>`;
+          if (e.followers) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">👥 ${e.followers} followers</span>`;
+          if (e.bio) html += `<div style="margin-top:4px;font-size:.72rem;color:var(--text3);font-style:italic">${esc(e.bio)}</div>`;
+          html += '</div>';
+        }
+        html += `</div>
+          <a href="${esc(f.url)}" target="_blank" style="background:${catColors[cat]||'#6b7280'};color:#fff;padding:4px 12px;border-radius:6px;font-size:.72rem;text-decoration:none;white-space:nowrap">Abrir ↗</a>
+        </div>`;
+      });
+      html += '</div></div>';
+    }
+  } else {
+    html += `<div style="text-align:center;padding:30px;color:var(--text3)">
+      <div style="font-size:2rem;margin-bottom:8px">🔍</div>
+      <div>No se encontraron cuentas para "${esc(data.query)}"</div>
+    </div>`;
+  }
+
+  // Breaches
+  if (data.breaches && data.breaches.length) {
+    html += `<div style="margin-bottom:16px;margin-top:8px">
+      <h3 style="color:#ef4444;margin-bottom:8px;font-size:.9rem">🔓 Data Breaches (${data.breaches.length})</h3>
+      <div style="display:flex;flex-direction:column;gap:5px">`;
+    data.breaches.forEach(b => {
+      html += `<div style="background:var(--bg2);border:1px solid #ef444433;border-radius:8px;padding:10px 14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <span style="color:var(--text1);font-weight:600;font-size:.85rem">${esc(b.name)}</span>
+          <span style="color:#ef4444;font-size:.72rem">${esc(b.date)}</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--text3)">Dominio: ${esc(b.domain)} · ${b.count ? b.count.toLocaleString() + ' cuentas afectadas' : ''}</div>
+        <div style="font-size:.72rem;color:var(--text3);margin-top:2px">Datos: ${esc(b.data)}</div>
+      </div>`;
+    });
+    html += '</div></div>';
+  }
+
+  // Dorks
+  if (data.dorks && data.dorks.length) {
+    html += `<div style="margin-bottom:16px;margin-top:8px">
+      <h3 style="color:var(--orange);margin-bottom:8px;font-size:.9rem">🔍 Dorks de Busqueda (${data.dorks.length})</h3>
+      <div style="display:flex;flex-direction:column;gap:5px">`;
+    data.dorks.forEach(d => {
+      html += `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--text1);font-size:.82rem;font-weight:600">${esc(d.name)}</span>
+          <a href="${esc(d.link)}" target="_blank" style="background:var(--orange);color:#fff;padding:2px 10px;border-radius:4px;font-size:.72rem;text-decoration:none">Buscar</a>
+        </div>
+        <div style="font-family:monospace;font-size:.72rem;color:var(--text3);margin-top:3px;word-break:break-all">${esc(d.query)}</div>
+      </div>`;
+    });
+    html += '</div></div>';
+  }
 
   el.innerHTML = html;
 });
