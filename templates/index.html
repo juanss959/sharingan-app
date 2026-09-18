@@ -234,6 +234,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
     </div>
 
     <div class="sidebar-bottom">
+      <div class="nav-item" data-mod="fuzzing" onclick="showModule('fuzzing')">
+        <span class="icon">🎯</span><span class="label">Fuzzing</span>
+      </div>
       <div class="nav-item" data-mod="osint" onclick="showModule('osint')">
         <span class="icon">🕵</span><span class="label">OSINT</span>
       </div>
@@ -278,6 +281,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div id="view-dirs" style="display:none"></div>
       <div id="view-urls" style="display:none"></div>
       <div id="view-js_secrets" style="display:none"></div>
+      <div id="view-fuzzing" style="display:none"></div>
       <div id="view-osint" style="display:none"></div>
       <div id="view-history" style="display:none"></div>
       <div id="view-tools" style="display:none"></div>
@@ -332,6 +336,12 @@ function showModule(mod) {
     document.getElementById('view-tools').style.display = '';
     setHeader('Herramientas', '');
     loadTools();
+    return;
+  }
+  if (mod === 'fuzzing') {
+    document.getElementById('view-fuzzing').style.display = '';
+    setHeader('🎯 Fuzzing', '');
+    if (!document.getElementById('fuzz-url')) initFuzzingView();
     return;
   }
   if (mod === 'osint') {
@@ -846,6 +856,177 @@ socket.on('osint_result', data => {
 
   el.innerHTML = html;
 });
+
+// ── Fuzzing (standalone tool) ──
+function initFuzzingView() {
+  const el = document.getElementById('view-fuzzing');
+  el.innerHTML = `
+    <div class="section-title"><span class="icon">🎯</span>Fuzzing de Directorios y Archivos</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input id="fuzz-url" type="text" placeholder="https://target.com" style="flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:.85rem;outline:none">
+      <button id="fuzz-btn" onclick="startFuzzing()" style="background:linear-gradient(135deg,#c62828,var(--red));color:#fff;border:none;border-radius:8px;padding:8px 18px;font-weight:600;cursor:pointer;font-size:.85rem">Fuzzear</button>
+    </div>
+    <div style="margin-bottom:12px">
+      <div style="color:var(--text2);font-size:.72rem;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Extensiones</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px" id="fuzz-exts">
+        ${['php','html','txt','bak','js','json','xml','env','sql','config','asp','jsp','log','zip','old'].map(e =>
+          `<label style="display:flex;align-items:center;gap:4px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:.78rem;cursor:pointer;user-select:none">
+            <input type="checkbox" value="${e}" class="fuzz-ext" style="accent-color:var(--red)">${e}</label>`
+        ).join('')}
+      </div>
+    </div>
+    <div style="display:flex;gap:16px;margin-bottom:12px;align-items:center">
+      <div>
+        <span style="color:var(--text2);font-size:.72rem;text-transform:uppercase;letter-spacing:1px">Threads</span>
+        <input id="fuzz-threads" type="number" value="40" min="1" max="100" style="width:60px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:.82rem;margin-left:6px;outline:none">
+      </div>
+      <div style="flex:1">
+        <span style="color:var(--text2);font-size:.72rem;text-transform:uppercase;letter-spacing:1px">Wordlist (opcional)</span>
+        <input id="fuzz-wordlist" type="text" placeholder="auto-detectar" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:.78rem;margin-top:3px;outline:none">
+      </div>
+    </div>
+    <div id="fuzz-status" style="display:none;margin-bottom:12px;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--accent);font-size:.82rem"></div>
+    <div id="fuzz-results"></div>
+  `;
+}
+
+function startFuzzing() {
+  const url = document.getElementById('fuzz-url').value.trim();
+  if (!url) return;
+  const exts = [...document.querySelectorAll('.fuzz-ext:checked')].map(c => c.value);
+  const threads = parseInt(document.getElementById('fuzz-threads').value) || 40;
+  const wordlist = document.getElementById('fuzz-wordlist').value.trim();
+
+  document.getElementById('fuzz-btn').disabled = true;
+  document.getElementById('fuzz-btn').textContent = 'Fuzzeando...';
+  document.getElementById('fuzz-results').innerHTML = '';
+  document.getElementById('fuzz-status').style.display = '';
+  document.getElementById('fuzz-status').textContent = 'Iniciando fuzzing...';
+
+  fuzzHits = [];
+  socket.emit('start_fuzzing', { url, extensions: exts, threads, wordlist });
+}
+
+let fuzzHits = [];
+
+socket.on('fuzz_status', data => {
+  const st = document.getElementById('fuzz-status');
+  if (st) { st.style.display = ''; st.textContent = data.msg; }
+  if (data.status === 'done') {
+    const btn = document.getElementById('fuzz-btn');
+    if (btn) { btn.disabled = false; btn.textContent = 'Fuzzear'; }
+    setTimeout(() => { if (st) st.style.display = 'none'; }, 4000);
+  }
+});
+
+socket.on('fuzz_hit', entry => {
+  fuzzHits.push(entry);
+  renderFuzzHitsLive();
+});
+
+socket.on('fuzz_result', data => {
+  renderFuzzResults(data);
+});
+
+function renderFuzzHitsLive() {
+  const el = document.getElementById('fuzz-results');
+  if (!el) return;
+  let html = `<div style="color:var(--text2);font-size:.78rem;margin-bottom:8px">${fuzzHits.length} encontrados hasta ahora...</div>`;
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th></tr></thead><tbody>';
+  fuzzHits.slice(-50).forEach(h => {
+    const sc = statusColor(h.status);
+    html += `<tr>
+      <td style="color:var(--accent);font-family:monospace;font-size:.8rem">/${esc(h.path)}</td>
+      <td><span style="color:${sc};font-weight:600">${h.status}</span></td>
+      <td><span style="background:${typeColor(h.type)};padding:1px 8px;border-radius:4px;font-size:.7rem;color:#fff">${esc(h.type)}</span></td>
+      <td style="color:var(--text2);font-size:.78rem">${formatBytes(h.length)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+function renderFuzzResults(data) {
+  const el = document.getElementById('fuzz-results');
+  if (!el) return;
+
+  const found = data.found || [];
+  if (!found.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin resultados</h3><p>No se encontraron directorios ni archivos.</p></div>';
+    return;
+  }
+
+  const dirs = found.filter(f => f.type === 'directory');
+  const files = found.filter(f => f.type === 'file');
+  const redirs = found.filter(f => f.type === 'redirect');
+
+  let html = `<div style="display:flex;gap:10px;margin-bottom:16px">
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.3rem;font-weight:700;color:var(--accent)">${found.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Total</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.3rem;font-weight:700;color:var(--cyan)">${dirs.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Directorios</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.3rem;font-weight:700;color:var(--orange)">${files.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Archivos</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.3rem;font-weight:700;color:var(--purple)">${redirs.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Redirects</div>
+    </div>
+  </div>`;
+
+  html += `<div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+    <input type="text" placeholder="Filtrar paths..." oninput="filterFuzz(this.value)" style="flex:1;max-width:280px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:.82rem;outline:none">
+    <span style="color:var(--text3);font-size:.75rem">Metodo: ${esc(data.method || 'auto')}</span>
+  </div>`;
+
+  html += '<div class="table-wrap"><table class="data-table" id="fuzz-table"><thead><tr><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th><th>Redirect</th></tr></thead><tbody>';
+  found.forEach(f => {
+    const sc = statusColor(f.status);
+    html += `<tr class="fuzz-row" data-path="${esc(f.path).toLowerCase()}">
+      <td><a href="${esc(f.url)}" target="_blank" style="color:var(--accent);font-family:monospace;font-size:.8rem;text-decoration:none">/${esc(f.path)}</a></td>
+      <td><span style="color:${sc};font-weight:600">${f.status}</span></td>
+      <td><span style="background:${typeColor(f.type)};padding:1px 8px;border-radius:4px;font-size:.7rem;color:#fff">${esc(f.type)}</span></td>
+      <td style="color:var(--text2);font-size:.78rem">${formatBytes(f.length)}</td>
+      <td style="color:var(--text3);font-size:.75rem;word-break:break-all">${f.redirect ? esc(f.redirect) : '-'}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+function filterFuzz(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.fuzz-row').forEach(r => {
+    r.style.display = r.dataset.path.includes(q) ? '' : 'none';
+  });
+}
+
+function statusColor(code) {
+  if (code >= 200 && code < 300) return 'var(--green)';
+  if (code >= 300 && code < 400) return 'var(--purple)';
+  if (code >= 400 && code < 500) return 'var(--orange)';
+  if (code >= 500) return 'var(--red)';
+  return 'var(--text2)';
+}
+
+function typeColor(t) {
+  if (t === 'directory') return 'var(--accent2)';
+  if (t === 'file') return '#c62828';
+  if (t === 'redirect') return '#7b1fa2';
+  return 'var(--text3)';
+}
+
+function formatBytes(b) {
+  if (!b) return '0 B';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
+}
 
 // ── History ──
 async function loadHistory() {

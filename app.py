@@ -641,6 +641,189 @@ def handle_osint(data):
     threading.Thread(target=run_osint, args=(domain,), daemon=True).start()
 
 
+# ── Standalone Fuzzing ──
+
+BUILTIN_WORDLIST = [
+    "admin","administrator","login","wp-admin","wp-login.php","dashboard",
+    "panel","console","api","api/v1","api/v2","graphql","swagger","swagger-ui",
+    "docs","doc","documentation","help","faq",
+    ".env",".git/HEAD",".git/config",".gitignore",".htaccess",".htpasswd",
+    "wp-config.php","config.php","configuration.php","settings.php",
+    "web.config","robots.txt","sitemap.xml","crossdomain.xml",
+    "phpinfo.php","info.php","test.php","server-status","server-info",
+    "backup","backups","bak","old","temp","tmp","test",
+    "db","database","dump","sql",
+    "uploads","upload","files","images","img","media","assets",
+    "static","css","js","fonts","includes","inc",
+    "cgi-bin","bin","scripts",
+    "register","signup","signin","logout","forgot","reset",
+    "profile","account","settings","config","setup","install",
+    "debug","trace","log","logs","error","errors",
+    "rest","swagger.json","api-docs","openapi.json","v1","v2",
+    "health","status","ping","users","user","posts","search",
+    "phpmyadmin","pma","adminer","wp-content","wp-includes",
+    ".well-known","security.txt",
+    "vendor","node_modules","package.json","composer.json",
+    "xmlrpc.php","readme.html","license.txt","changelog.txt",
+    "secret","private","internal","staging","dev","beta",
+    "manager","portal","webmail","mail","email","cpanel",
+    "shell","cmd","command","exec","run","system",
+    "filemanager","editor","ide","terminal",
+]
+
+
+def find_wordlist():
+    candidates = [
+        Path.home() / "wordlists" / "common.txt",
+        Path(r"C:\SecLists\Discovery\Web-Content\common.txt"),
+        Path.home() / "SecLists" / "Discovery" / "Web-Content" / "common.txt",
+    ]
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("dirsearch")
+        if spec and spec.origin:
+            ds_path = Path(spec.origin).parent / "db" / "dicc.txt"
+            if ds_path.exists():
+                candidates.insert(0, ds_path)
+    except Exception:
+        pass
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def categorize_path(path, redirect):
+    path_lower = path.lower()
+    file_exts = ['.php','.asp','.aspx','.jsp','.html','.htm','.js','.css',
+                 '.txt','.xml','.json','.yml','.yaml','.env','.bak','.sql',
+                 '.log','.zip','.tar','.gz','.config','.ini','.pdf','.doc']
+    if any(path_lower.endswith(ext) for ext in file_exts):
+        return "file"
+    if redirect:
+        return "redirect"
+    return "directory"
+
+
+def run_fuzzing(url, extensions, threads, wordlist_path):
+    socketio.emit("fuzz_status", {"status": "running", "msg": "Preparando fuzzing..."})
+    results = {"found": [], "total_requests": 0, "method": ""}
+
+    url = url.rstrip('/')
+
+    use_ffuf = False
+    try:
+        r = subprocess.run('ffuf -V', shell=True, capture_output=True,
+                           text=True, timeout=5, env=get_env())
+        use_ffuf = r.returncode == 0 or len(r.stdout + r.stderr) > 0
+    except Exception:
+        pass
+
+    tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-fuzz-{int(time.time())}"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    if use_ffuf and wordlist_path:
+        results["method"] = "ffuf"
+        socketio.emit("fuzz_status", {"status": "running", "msg": "Ejecutando ffuf..."})
+
+        output_file = tmpdir / "ffuf.json"
+        ext_flag = f' -e .{",".join(extensions)}' if extensions else ''
+        cmd = (f'ffuf -u "{url}/FUZZ" -w "{wordlist_path}" '
+               f'-o "{output_file}" -of json -mc all -fc 404 '
+               f'-t {threads} -timeout 10 -ac{ext_flag} -s')
+
+        run_cmd(cmd)
+
+        if output_file.exists():
+            try:
+                data = json.loads(output_file.read_text(encoding='utf-8', errors='replace'))
+                for r in data.get("results", []):
+                    entry = {
+                        "url": r.get("url", ""),
+                        "status": r.get("status", 0),
+                        "length": r.get("length", 0),
+                        "words": r.get("words", 0),
+                        "lines": r.get("lines", 0),
+                        "path": r.get("input", {}).get("FUZZ", ""),
+                        "redirect": r.get("redirectlocation", ""),
+                        "type": categorize_path(
+                            r.get("input", {}).get("FUZZ", ""),
+                            r.get("redirectlocation", ""))
+                    }
+                    results["found"].append(entry)
+                results["total_requests"] = data.get("numberofRequests", len(results["found"]))
+            except Exception:
+                pass
+    else:
+        results["method"] = "python"
+        socketio.emit("fuzz_status", {"status": "running", "msg": "Fuzzing nativo (sin ffuf)..."})
+
+        paths = BUILTIN_WORDLIST[:]
+        if extensions:
+            extra = []
+            for word in paths[:60]:
+                for ext in extensions:
+                    extra.append(f"{word}.{ext}")
+            paths.extend(extra)
+
+        total = len(paths)
+        for i, path in enumerate(paths):
+            if i % 25 == 0:
+                socketio.emit("fuzz_status", {
+                    "status": "running",
+                    "msg": f"Probando {i}/{total} paths..."
+                })
+            try:
+                test_url = f"{url}/{path}"
+                resp = requests.get(test_url, timeout=5, allow_redirects=False,
+                                    headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+                if resp.status_code != 404:
+                    redir = resp.headers.get("Location", "")
+                    entry = {
+                        "url": test_url,
+                        "status": resp.status_code,
+                        "length": len(resp.content),
+                        "words": len(resp.text.split()),
+                        "lines": len(resp.text.splitlines()),
+                        "path": path,
+                        "redirect": redir,
+                        "type": categorize_path(path, redir)
+                    }
+                    results["found"].append(entry)
+                    socketio.emit("fuzz_hit", entry)
+            except Exception:
+                continue
+        results["total_requests"] = total
+
+    results["found"].sort(key=lambda x: (x["status"], x["path"]))
+    socketio.emit("fuzz_result", results)
+    socketio.emit("fuzz_status", {
+        "status": "done",
+        "msg": f"Fuzzing completado: {len(results['found'])} encontrados"
+    })
+
+    import shutil
+    try:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+@socketio.on("start_fuzzing")
+def handle_fuzzing(data):
+    url = data.get("url", "").strip()
+    if not url:
+        return
+    if not url.startswith("http"):
+        url = "https://" + url
+    extensions = data.get("extensions", [])
+    threads = min(data.get("threads", 40), 100)
+    wordlist = data.get("wordlist", "").strip()
+    if not wordlist or not Path(wordlist).exists():
+        wordlist = find_wordlist()
+    threading.Thread(target=run_fuzzing, args=(url, extensions, threads, wordlist), daemon=True).start()
+
+
 def update_scan(scan_id, **kwargs):
     db = get_db()
     sets = ", ".join(f"{k} = ?" for k in kwargs)
