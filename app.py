@@ -770,11 +770,381 @@ PLATFORM_CHECKS = [
     {"name": "Trello", "cat": "social", "url": "https://trello.com/{}", "icon": "📋"},
 ]
 
-EMAIL_SERVICES = [
-    {"name": "Gravatar", "url": "https://en.gravatar.com/{}.json", "icon": "👤"},
-    {"name": "GitHub (email)", "url": "https://api.github.com/search/users?q={}+in:email", "icon": "🐙", "json_check": True},
-    {"name": "Have I Been Pwned", "url": "https://haveibeenpwned.com/unifiedsearch/{}", "icon": "🔓"},
+EMAIL_PLATFORM_CHECKS = [
+    {"name": "Gravatar", "cat": "social", "icon": "👤", "method": "gravatar"},
+    {"name": "GitHub", "cat": "dev", "icon": "🐙", "method": "github_email"},
+    {"name": "Spotify", "cat": "social", "icon": "🎧", "method": "spotify"},
+    {"name": "Pinterest", "cat": "social", "icon": "📌", "method": "pinterest"},
+    {"name": "Flickr", "cat": "social", "icon": "📷", "method": "flickr"},
+    {"name": "Duolingo", "cat": "social", "icon": "🦉", "method": "duolingo"},
+    {"name": "Chess.com", "cat": "gaming", "icon": "♟", "method": "chess"},
+    {"name": "WordPress", "cat": "blog", "icon": "📝", "method": "wordpress"},
+    {"name": "Tumblr", "cat": "blog", "icon": "📘", "method": "tumblr"},
+    {"name": "Docker Hub", "cat": "dev", "icon": "🐳", "method": "docker"},
+    {"name": "Patreon", "cat": "social", "icon": "💰", "method": "patreon"},
+    {"name": "Adobe", "cat": "software", "icon": "🎨", "method": "adobe"},
+    {"name": "Samsung", "cat": "software", "icon": "📱", "method": "samsung"},
+    {"name": "Atlassian", "cat": "dev", "icon": "🔷", "method": "atlassian"},
+    {"name": "GitLab", "cat": "dev", "icon": "🦊", "method": "gitlab"},
+    {"name": "Twitter/X", "cat": "social", "icon": "🐦", "method": "twitter"},
+    {"name": "Instagram", "cat": "social", "icon": "📸", "method": "instagram"},
+    {"name": "Discord", "cat": "social", "icon": "💬", "method": "discord"},
+    {"name": "Imgur", "cat": "social", "icon": "🖼", "method": "imgur"},
+    {"name": "Strava", "cat": "social", "icon": "🏃", "method": "strava"},
+    {"name": "Replit", "cat": "dev", "icon": "💻", "method": "replit"},
+    {"name": "Scribd", "cat": "social", "icon": "📖", "method": "scribd"},
+    {"name": "Zoom", "cat": "software", "icon": "📹", "method": "zoom"},
+    {"name": "Microsoft", "cat": "software", "icon": "🪟", "method": "microsoft"},
+    {"name": "Apple", "cat": "software", "icon": "🍎", "method": "apple"},
+    {"name": "Amazon", "cat": "shopping", "icon": "📦", "method": "amazon"},
+    {"name": "eBay", "cat": "shopping", "icon": "🛒", "method": "ebay"},
+    {"name": "Booking.com", "cat": "shopping", "icon": "🏨", "method": "booking"},
 ]
+
+
+def _check_email_platform(platform, email, results_list, session):
+    import hashlib
+    method = platform["method"]
+    found = False
+    profile_url = ""
+    extra_info = {}
+
+    try:
+        if method == "gravatar":
+            email_hash = hashlib.md5(email.lower().strip().encode()).hexdigest()
+            resp = session.get(f"https://en.gravatar.com/{email_hash}.json", timeout=8)
+            if resp.status_code == 200:
+                found = True
+                profile_url = f"https://en.gravatar.com/{email_hash}"
+                try:
+                    data = resp.json()
+                    entry = data.get("entry", [{}])[0]
+                    extra_info["name"] = entry.get("displayName", "")
+                    extra_info["about"] = entry.get("aboutMe", "")[:100] if entry.get("aboutMe") else ""
+                    extra_info["location"] = entry.get("currentLocation", "")
+                    if entry.get("photos"):
+                        extra_info["avatar"] = entry["photos"][0].get("value", "")
+                    if entry.get("accounts"):
+                        extra_info["linked_accounts"] = [
+                            {"platform": a.get("shortname", ""), "url": a.get("url", "")}
+                            for a in entry["accounts"][:5]
+                        ]
+                except Exception:
+                    pass
+
+        elif method == "github_email":
+            resp = session.get(f"https://api.github.com/search/users?q={email}+in:email", timeout=8,
+                               headers={"Accept": "application/vnd.github.v3+json"})
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("total_count", 0) > 0:
+                    found = True
+                    user = data["items"][0]
+                    profile_url = user.get("html_url", "")
+                    extra_info["username"] = user.get("login", "")
+                    extra_info["avatar"] = user.get("avatar_url", "")
+
+        elif method == "spotify":
+            resp = session.get("https://spclient.wg.spotify.com/signup/public/v1/account",
+                               params={"validate": "1", "email": email}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("status") == 20:
+                        found = True
+                        profile_url = "https://spotify.com"
+                except Exception:
+                    pass
+
+        elif method == "pinterest":
+            resp = session.get(f"https://www.pinterest.com/_ngjs/resource/EmailExistsResource/get/",
+                               params={"source_url": "/", "data": json.dumps({"options": {"email": email}})},
+                               timeout=8)
+            if resp.status_code == 200:
+                try:
+                    if "resource_response" in resp.text and "true" in resp.text.lower():
+                        found = True
+                        profile_url = "https://pinterest.com"
+                except Exception:
+                    pass
+
+        elif method == "flickr":
+            resp = session.get(f"https://www.flickr.com/people/{email.split('@')[0]}/", timeout=8)
+            if resp.status_code == 200 and "page not found" not in resp.text.lower():
+                found = True
+                profile_url = f"https://www.flickr.com/people/{email.split('@')[0]}/"
+
+        elif method == "duolingo":
+            resp = session.get(f"https://www.duolingo.com/2017-06-30/users?email={email}", timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("users") and len(data["users"]) > 0:
+                        found = True
+                        user = data["users"][0]
+                        extra_info["username"] = user.get("username", "")
+                        profile_url = f"https://www.duolingo.com/profile/{user.get('username', '')}"
+                except Exception:
+                    pass
+
+        elif method == "chess":
+            resp = session.get(f"https://www.chess.com/callback/email/available?email={email}", timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("isEmailAvailable") is False:
+                        found = True
+                        profile_url = "https://chess.com"
+                except Exception:
+                    pass
+
+        elif method == "wordpress":
+            resp = session.post("https://wordpress.com/wp-login.php?action=lostpassword",
+                                data={"user_login": email}, timeout=8, allow_redirects=False)
+            if resp.status_code == 302 and "check-your-email" in resp.headers.get("Location", ""):
+                found = True
+                profile_url = "https://wordpress.com"
+
+        elif method == "tumblr":
+            resp = session.post("https://www.tumblr.com/api/v2/register/email_available",
+                                json={"email": email}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if not data.get("response", {}).get("available", True):
+                        found = True
+                        profile_url = "https://tumblr.com"
+                except Exception:
+                    pass
+
+        elif method == "docker":
+            resp = session.post("https://hub.docker.com/v2/users/signup/",
+                                json={"email": email, "username": "x" * 30, "password": "x" * 30},
+                                timeout=8)
+            if resp.status_code in (200, 400):
+                body = resp.text.lower()
+                if "already" in body or "registered" in body or "exists" in body or "in use" in body:
+                    found = True
+                    profile_url = "https://hub.docker.com"
+
+        elif method == "patreon":
+            resp = session.post("https://www.patreon.com/api/auth/email-check",
+                                json={"data": {"email": email}}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("data", {}).get("email_exists"):
+                        found = True
+                        profile_url = "https://patreon.com"
+                except Exception:
+                    pass
+
+        elif method == "adobe":
+            resp = session.post("https://auth.services.adobe.com/signin/v2/users/accounts",
+                                json={"username": email}, timeout=8,
+                                headers={"Content-Type": "application/json", "x-ims-clientid": "adobedotcom2"})
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data and len(data) > 0:
+                        found = True
+                        profile_url = "https://account.adobe.com"
+                        if isinstance(data, list) and data:
+                            extra_info["auth_type"] = data[0].get("type", "")
+                except Exception:
+                    pass
+
+        elif method == "samsung":
+            resp = session.post("https://account.samsung.com/accounts/v1/MBR/checkEmailID",
+                                json={"emailID": email}, timeout=8)
+            if resp.status_code == 200 and "exists" in resp.text.lower():
+                found = True
+                profile_url = "https://account.samsung.com"
+
+        elif method == "atlassian":
+            resp = session.post("https://id.atlassian.com/rest/check-username",
+                                json={"username": email}, timeout=8,
+                                headers={"Content-Type": "application/json"})
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("valid"):
+                        found = True
+                        profile_url = "https://id.atlassian.com"
+                except Exception:
+                    pass
+
+        elif method == "gitlab":
+            resp = session.get(f"https://gitlab.com/api/v4/users?search={email}", timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        found = True
+                        profile_url = data[0].get("web_url", "https://gitlab.com")
+                        extra_info["username"] = data[0].get("username", "")
+                except Exception:
+                    pass
+
+        elif method == "twitter":
+            resp = session.get(f"https://api.twitter.com/i/users/email_available.json?email={email}", timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("taken"):
+                        found = True
+                        profile_url = "https://x.com"
+                except Exception:
+                    pass
+
+        elif method == "instagram":
+            resp = session.post("https://www.instagram.com/api/v1/web/accounts/web_create_ajax/check_email/",
+                                data={"email": email}, timeout=8,
+                                headers={"X-Requested-With": "XMLHttpRequest"})
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("email_is_taken"):
+                        found = True
+                        profile_url = "https://instagram.com"
+                except Exception:
+                    pass
+
+        elif method == "discord":
+            resp = session.post("https://discord.com/api/v9/auth/register",
+                                json={"email": email, "username": "x" * 20, "password": "x" * 20},
+                                timeout=8)
+            if resp.status_code in (200, 400):
+                body = resp.text.lower()
+                if "already" in body or "registered" in body or "in use" in body:
+                    found = True
+                    profile_url = "https://discord.com"
+
+        elif method == "imgur":
+            resp = session.get(f"https://imgur.com/signin/ajax_email_check?email={email}", timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("data", {}).get("available") is False:
+                        found = True
+                        profile_url = "https://imgur.com"
+                except Exception:
+                    pass
+
+        elif method == "strava":
+            resp = session.post("https://www.strava.com/api/v3/email_check",
+                                data={"email": email}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("exists"):
+                        found = True
+                        profile_url = "https://strava.com"
+                except Exception:
+                    pass
+
+        elif method == "replit":
+            resp = session.post("https://replit.com/graphql",
+                                json={"query": f'query {{ userByEmail(email: "{email}") {{ username }} }}'},
+                                timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    user = data.get("data", {}).get("userByEmail")
+                    if user:
+                        found = True
+                        extra_info["username"] = user.get("username", "")
+                        profile_url = f"https://replit.com/@{user.get('username', '')}"
+                except Exception:
+                    pass
+
+        elif method == "scribd":
+            resp = session.post("https://www.scribd.com/login",
+                                data={"login_or_email": email, "login_password": "x" * 10},
+                                timeout=8, allow_redirects=False)
+            if resp.status_code in (200, 302):
+                body = resp.text.lower() if resp.status_code == 200 else ""
+                if "incorrect password" in body or "wrong password" in body or resp.status_code == 302:
+                    found = True
+                    profile_url = "https://scribd.com"
+
+        elif method == "zoom":
+            resp = session.post("https://us04web.zoom.us/api/v1/account/check_email",
+                                data={"email": email}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("existed"):
+                        found = True
+                        profile_url = "https://zoom.us"
+                except Exception:
+                    pass
+
+        elif method == "microsoft":
+            resp = session.post("https://login.live.com/GetCredentialType.srf",
+                                json={"username": email}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("IfExistsResult") == 0:
+                        found = True
+                        profile_url = "https://account.microsoft.com"
+                except Exception:
+                    pass
+
+        elif method == "apple":
+            resp = session.post("https://iforgot.apple.com/password/verify/appleid",
+                                json={"id": email}, timeout=8,
+                                headers={"Content-Type": "application/json",
+                                          "Accept": "application/json"})
+            if resp.status_code == 200:
+                found = True
+                profile_url = "https://appleid.apple.com"
+
+        elif method == "amazon":
+            resp = session.post("https://www.amazon.com/ap/signin",
+                                data={"email": email, "create": "0"},
+                                timeout=8, allow_redirects=False)
+            if resp.status_code in (200, 302):
+                body = resp.text.lower() if resp.status_code == 200 else ""
+                if "password" in body or resp.status_code == 302:
+                    found = True
+                    profile_url = "https://amazon.com"
+
+        elif method == "ebay":
+            resp = session.post("https://signin.ebay.com/ws/eBayISAPI.dll?SignIn",
+                                data={"userid": email}, timeout=8, allow_redirects=False)
+            if resp.status_code in (200, 302):
+                body = resp.text.lower() if resp.status_code == 200 else ""
+                if "password" in body or "enter your password" in body:
+                    found = True
+                    profile_url = "https://ebay.com"
+
+        elif method == "booking":
+            resp = session.post("https://account.booking.com/api/identity/email-check",
+                                json={"email": email}, timeout=8)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("matching_credentials"):
+                        found = True
+                        profile_url = "https://booking.com"
+                except Exception:
+                    pass
+
+    except Exception:
+        pass
+
+    if found:
+        result = {
+            "platform": platform["name"],
+            "url": profile_url or "#",
+            "icon": platform["icon"],
+            "cat": platform.get("cat", "other"),
+        }
+        if extra_info:
+            result["extra"] = extra_info
+        results_list.append(result)
 
 
 def _check_platform(platform, username, results_list, session):
@@ -885,22 +1255,22 @@ def run_user_osint(query, mode):
         email_local = query.split("@")[0] if "@" in query else query
         email_domain = query.split("@")[1] if "@" in query else ""
 
-        socketio.emit("user_osint_status", {"status": "running", "msg": "Buscando username en plataformas..."})
+        socketio.emit("user_osint_status", {"status": "running", "msg": f"Verificando email en {len(EMAIL_PLATFORM_CHECKS)} servicios..."})
         threads = []
         found_list = []
-        for plat in PLATFORM_CHECKS:
-            t = threading.Thread(target=_check_platform, args=(plat, email_local, found_list, session), daemon=True)
+        for plat in EMAIL_PLATFORM_CHECKS:
+            t = threading.Thread(target=_check_email_platform, args=(plat, query, found_list, session), daemon=True)
             threads.append(t)
             t.start()
         for i, t in enumerate(threads):
-            t.join(timeout=12)
-            if (i + 1) % 10 == 0 or i == len(threads) - 1:
+            t.join(timeout=15)
+            if (i + 1) % 8 == 0 or i == len(threads) - 1:
                 socketio.emit("user_osint_status", {
                     "status": "running",
-                    "msg": f"Verificadas {i + 1}/{len(PLATFORM_CHECKS)} plataformas... ({len(found_list)} encontradas)"
+                    "msg": f"Verificados {i + 1}/{len(EMAIL_PLATFORM_CHECKS)} servicios... ({len(found_list)} con cuenta)"
                 })
         results["found"] = sorted(found_list, key=lambda x: x["platform"])
-        results["total_checked"] = len(PLATFORM_CHECKS)
+        results["total_checked"] = len(EMAIL_PLATFORM_CHECKS)
 
         socketio.emit("user_osint_status", {"status": "running", "msg": "Buscando breaches conocidos..."})
         try:

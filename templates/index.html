@@ -1011,8 +1011,8 @@ socket.on('user_osint_result', data => {
 
   // Platforms found by category
   if (data.found.length) {
-    const catNames = {social:'Redes Sociales',dev:'Desarrollo',gaming:'Gaming',security:'Seguridad',blog:'Blogs',other:'Otros'};
-    const catColors = {social:'#a855f7',dev:'#3b82f6',gaming:'#22c55e',security:'#ef4444',blog:'#f59e0b',other:'#6b7280'};
+    const catNames = {social:'Redes Sociales',dev:'Desarrollo',gaming:'Gaming',security:'Seguridad',blog:'Blogs',software:'Software',shopping:'Shopping / Servicios',other:'Otros'};
+    const catColors = {social:'#a855f7',dev:'#3b82f6',gaming:'#22c55e',security:'#ef4444',blog:'#f59e0b',software:'#06b6d4',shopping:'#f97316',other:'#6b7280'};
     const grouped = {};
     data.found.forEach(f => {
       const c = f.cat || 'other';
@@ -1036,11 +1036,21 @@ socket.on('user_osint_result', data => {
           const e = f.extra;
           html += `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">`;
           if (e.name) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">👤 ${esc(e.name)}</span>`;
+          if (e.username) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">🏷 @${esc(e.username)}</span>`;
           if (e.location) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">📍 ${esc(e.location)}</span>`;
           if (e.company) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">🏢 ${esc(e.company)}</span>`;
           if (e.repos) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">📦 ${e.repos} repos</span>`;
           if (e.followers) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">👥 ${e.followers} followers</span>`;
+          if (e.auth_type) html += `<span style="background:var(--bg1);border-radius:4px;padding:2px 8px;font-size:.72rem;color:var(--text2)">🔑 ${esc(e.auth_type)}</span>`;
           if (e.bio) html += `<div style="margin-top:4px;font-size:.72rem;color:var(--text3);font-style:italic">${esc(e.bio)}</div>`;
+          if (e.about) html += `<div style="margin-top:4px;font-size:.72rem;color:var(--text3);font-style:italic">${esc(e.about)}</div>`;
+          if (e.linked_accounts && e.linked_accounts.length) {
+            html += `<div style="margin-top:6px"><span style="font-size:.68rem;color:var(--text3)">Cuentas vinculadas:</span>`;
+            e.linked_accounts.forEach(a => {
+              html += ` <a href="${esc(a.url)}" target="_blank" style="font-size:.7rem;color:var(--accent);text-decoration:none">${esc(a.platform||a.url)}</a>`;
+            });
+            html += '</div>';
+          }
           html += '</div>';
         }
         html += `</div>
