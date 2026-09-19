@@ -501,7 +501,7 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
 
 def run_osint(domain):
     results = {"emails": [], "social": [], "meta": [], "wayback": [], "wayback_total": 0,
-               "gdorks": [], "gitdorks": []}
+               "gdorks": [], "gitdorks": [], "gh_repos": [], "gh_code": [], "gh_gists": []}
 
     socketio.emit("osint_status", {"status": "running", "msg": "Descargando pagina..."})
 
@@ -591,7 +591,96 @@ def run_osint(domain):
     except Exception:
         pass
 
-    # 4. Google Dorks
+    # 4. GitHub Recon (live API search)
+    gh_headers = {"Accept": "application/vnd.github.v3+json", "User-Agent": "Sharingan-OSINT"}
+    try:
+        gh_cmd = str(SCOOP_SHIMS / "gh.exe") if (SCOOP_SHIMS / "gh.exe").exists() else "gh"
+        gh_token = subprocess.check_output([gh_cmd, "auth", "token"], stderr=subprocess.DEVNULL, text=True).strip()
+        if gh_token:
+            gh_headers["Authorization"] = f"token {gh_token}"
+    except Exception:
+        pass
+
+    # 4a. Repos mentioning the domain
+    socketio.emit("osint_status", {"status": "running", "msg": "Buscando repositorios en GitHub..."})
+    try:
+        gh_resp = requests.get(
+            f"https://api.github.com/search/repositories?q={requests.utils.quote(domain)}&sort=updated&per_page=15",
+            headers=gh_headers, timeout=12)
+        if gh_resp.status_code == 200:
+            for repo in gh_resp.json().get("items", []):
+                results["gh_repos"].append({
+                    "name": repo.get("full_name", ""),
+                    "url": repo.get("html_url", ""),
+                    "description": (repo.get("description") or "")[:150],
+                    "stars": repo.get("stargazers_count", 0),
+                    "forks": repo.get("forks_count", 0),
+                    "language": repo.get("language") or "",
+                    "updated": (repo.get("updated_at") or "")[:10],
+                    "owner_avatar": repo.get("owner", {}).get("avatar_url", ""),
+                })
+    except Exception:
+        pass
+
+    # 4b. Code search for secrets
+    socketio.emit("osint_status", {"status": "running", "msg": "Buscando secretos en codigo..."})
+    secret_queries = [
+        ("API Keys / Tokens", f'"{domain}" password OR api_key OR apikey OR secret OR token OR bearer'),
+        ("Config Files", f'"{domain}" filename:.env OR filename:.yml OR filename:.config OR filename:.ini'),
+        ("AWS Credentials", f'"{domain}" AKIA OR aws_secret_access_key OR AWS_ACCESS_KEY'),
+        ("Private Keys", f'"{domain}" "BEGIN RSA PRIVATE KEY" OR "BEGIN EC PRIVATE KEY" OR "BEGIN OPENSSH"'),
+        ("DB Connections", f'"{domain}" mysql:// OR postgres:// OR mongodb:// OR redis://'),
+        ("OAuth / JWT", f'"{domain}" client_secret OR client_id OR jwt OR oauth'),
+        ("Hardcoded Creds", f'"{domain}" password= OR passwd= OR pwd= OR credentials'),
+        ("Internal URLs", f'"{domain}" staging OR internal OR dev OR localhost OR 127.0.0.1'),
+    ]
+    for label, query in secret_queries:
+        try:
+            code_resp = requests.get(
+                f"https://api.github.com/search/code?q={requests.utils.quote(query)}&per_page=5",
+                headers=gh_headers, timeout=10)
+            if code_resp.status_code == 200:
+                code_data = code_resp.json()
+                total = code_data.get("total_count", 0)
+                items = []
+                for item in code_data.get("items", []):
+                    items.append({
+                        "file": item.get("name", ""),
+                        "path": item.get("path", ""),
+                        "repo": item.get("repository", {}).get("full_name", ""),
+                        "url": item.get("html_url", ""),
+                    })
+                if total > 0:
+                    results["gh_code"].append({
+                        "label": label,
+                        "query": query,
+                        "total": total,
+                        "items": items,
+                        "search_url": f"https://github.com/search?q={requests.utils.quote(query)}&type=code",
+                    })
+            time.sleep(2)
+        except Exception:
+            pass
+
+    # 4c. Gists mentioning the domain
+    socketio.emit("osint_status", {"status": "running", "msg": "Buscando en GitHub Gists..."})
+    try:
+        gist_resp = requests.get(
+            f"https://api.github.com/search/code?q={requests.utils.quote(domain)}+in:file+language:text&per_page=10",
+            headers=gh_headers, timeout=10)
+        if gist_resp.status_code == 200:
+            for item in gist_resp.json().get("items", []):
+                repo_name = item.get("repository", {}).get("full_name", "")
+                if "gist" in repo_name.lower() or "snippet" in repo_name.lower():
+                    results["gh_gists"].append({
+                        "file": item.get("name", ""),
+                        "repo": repo_name,
+                        "url": item.get("html_url", ""),
+                    })
+    except Exception:
+        pass
+
+    # 5. Google Dorks
     socketio.emit("osint_status", {"status": "running", "msg": "Generando Google Dorks..."})
     dorks = [
         ("Archivos Sensibles", f'site:{domain} (filetype:pdf OR filetype:doc OR filetype:xls OR filetype:sql OR filetype:env OR filetype:log OR filetype:bak)'),
