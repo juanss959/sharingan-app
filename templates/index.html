@@ -237,6 +237,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div class="nav-item" data-mod="fuzzing" onclick="showModule('fuzzing')">
         <span class="icon">🎯</span><span class="label">Fuzzing</span>
       </div>
+      <div class="nav-item" data-mod="bypass403" onclick="showModule('bypass403')">
+        <span class="icon">🔓</span><span class="label">403 Bypass</span>
+      </div>
       <div class="nav-item" data-mod="osint" onclick="showModule('osint')">
         <span class="icon">🕵</span><span class="label">OSINT</span>
       </div>
@@ -285,6 +288,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div id="view-urls" style="display:none"></div>
       <div id="view-js_secrets" style="display:none"></div>
       <div id="view-fuzzing" style="display:none"></div>
+      <div id="view-bypass403" style="display:none"></div>
       <div id="view-osint" style="display:none"></div>
       <div id="view-user_osint" style="display:none"></div>
       <div id="view-history" style="display:none"></div>
@@ -346,6 +350,12 @@ function showModule(mod) {
     document.getElementById('view-fuzzing').style.display = '';
     setHeader('🎯 Fuzzing', '');
     if (!document.getElementById('fuzz-url')) initFuzzingView();
+    return;
+  }
+  if (mod === 'bypass403') {
+    document.getElementById('view-bypass403').style.display = '';
+    setHeader('🔓 403 Bypass', '');
+    if (!document.getElementById('bypass-url')) initBypassView();
     return;
   }
   if (mod === 'osint') {
@@ -1226,15 +1236,30 @@ function renderFuzzResults(data) {
     </div>
   </div>`;
 
-  html += `<div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
-    <input type="text" placeholder="Filtrar paths..." oninput="filterFuzz(this.value)" style="flex:1;max-width:280px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:.82rem;outline:none">
+  const statusCounts = {};
+  found.forEach(f => { statusCounts[f.status] = (statusCounts[f.status] || 0) + 1; });
+  const statusKeys = Object.keys(statusCounts).sort((a,b) => a - b);
+
+  html += `<div style="margin-bottom:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+    <input type="text" placeholder="Filtrar paths..." oninput="filterFuzz()" id="fuzz-path-filter" style="flex:1;max-width:280px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:.82rem;outline:none">
+    <select id="fuzz-status-filter" onchange="filterFuzz()" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:.82rem;outline:none;cursor:pointer">
+      <option value="all">Todos los status</option>
+      <option value="2xx">Solo 2xx (OK)</option>
+      <option value="3xx">Solo 3xx (Redirect)</option>
+      <option value="4xx">Solo 4xx (Error)</option>
+      <option value="no403">Ocultar 403</option>
+      <option value="no404">Ocultar 404</option>
+      <option value="interesting">Interesantes (200, 301, 302, 500+)</option>
+      ${statusKeys.map(s => `<option value="${s}">Solo ${s} (${statusCounts[s]})</option>`).join('')}
+    </select>
     <span style="color:var(--text3);font-size:.75rem">Metodo: ${esc(data.method || 'auto')}</span>
   </div>`;
 
+  html += '<div id="fuzz-visible-count" style="color:var(--text3);font-size:.72rem;margin-bottom:6px"></div>';
   html += '<div class="table-wrap"><table class="data-table" id="fuzz-table"><thead><tr><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th><th>Redirect</th></tr></thead><tbody>';
   found.forEach(f => {
     const sc = statusColor(f.status);
-    html += `<tr class="fuzz-row" data-path="${esc(f.path).toLowerCase()}">
+    html += `<tr class="fuzz-row" data-path="${esc(f.path).toLowerCase()}" data-status="${f.status}">
       <td><a href="${esc(f.url)}" target="_blank" style="color:var(--accent);font-family:monospace;font-size:.8rem;text-decoration:none">/${esc(f.path)}</a></td>
       <td><span style="color:${sc};font-weight:600">${f.status}</span></td>
       <td><span style="background:${typeColor(f.type)};padding:1px 8px;border-radius:4px;font-size:.7rem;color:#fff">${esc(f.type)}</span></td>
@@ -1246,11 +1271,28 @@ function renderFuzzResults(data) {
   el.innerHTML = html;
 }
 
-function filterFuzz(q) {
-  q = q.toLowerCase();
+function filterFuzz() {
+  const q = (document.getElementById('fuzz-path-filter')?.value || '').toLowerCase();
+  const sf = document.getElementById('fuzz-status-filter')?.value || 'all';
+  let visible = 0;
   document.querySelectorAll('.fuzz-row').forEach(r => {
-    r.style.display = r.dataset.path.includes(q) ? '' : 'none';
+    const path = r.dataset.path;
+    const status = parseInt(r.dataset.status);
+    let show = path.includes(q);
+    if (show && sf !== 'all') {
+      if (sf === '2xx') show = status >= 200 && status < 300;
+      else if (sf === '3xx') show = status >= 300 && status < 400;
+      else if (sf === '4xx') show = status >= 400 && status < 500;
+      else if (sf === 'no403') show = status !== 403;
+      else if (sf === 'no404') show = status !== 404;
+      else if (sf === 'interesting') show = (status >= 200 && status < 300) || status === 301 || status === 302 || status >= 500;
+      else show = status === parseInt(sf);
+    }
+    r.style.display = show ? '' : 'none';
+    if (show) visible++;
   });
+  const counter = document.getElementById('fuzz-visible-count');
+  if (counter) counter.textContent = `${visible} resultados visibles`;
 }
 
 function statusColor(code) {
@@ -1273,6 +1315,153 @@ function formatBytes(b) {
   if (b < 1024) return b + ' B';
   if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
   return (b/1048576).toFixed(1) + ' MB';
+}
+
+// ── 403 Bypass ──
+function initBypassView() {
+  const el = document.getElementById('view-bypass403');
+  el.innerHTML = `
+    <div class="section-title"><span class="icon">🔓</span>403 Bypass Testing</div>
+    <p style="color:var(--text2);font-size:.82rem;margin-bottom:14px">Ingresa una URL que retorne 403 y se probaran multiples tecnicas de bypass (headers, path manipulation, metodos HTTP).</p>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <input id="bypass-url" type="text" placeholder="https://ejemplo.com/admin" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:9px 14px;color:var(--text);font-size:.88rem;outline:none;font-family:monospace" onkeydown="if(event.key==='Enter')startBypass()">
+      <button id="bypass-btn" onclick="startBypass()" style="background:linear-gradient(135deg,#7b1fa2,#b388ff);color:#fff;border:none;border-radius:8px;padding:8px 18px;font-weight:600;cursor:pointer;font-size:.85rem;white-space:nowrap">Iniciar Bypass</button>
+    </div>
+    <div id="bypass-status" style="display:none;margin-bottom:12px;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--accent);font-size:.82rem"></div>
+    <div id="bypass-results"></div>
+  `;
+}
+
+function startBypass() {
+  const url = document.getElementById('bypass-url').value.trim();
+  if (!url) return;
+  document.getElementById('bypass-btn').disabled = true;
+  document.getElementById('bypass-btn').textContent = 'Probando...';
+  document.getElementById('bypass-results').innerHTML = '';
+  document.getElementById('bypass-status').style.display = '';
+  document.getElementById('bypass-status').textContent = 'Iniciando bypass...';
+  bypassHits = [];
+  socket.emit('start_bypass', { url });
+}
+
+let bypassHits = [];
+
+socket.on('bypass_status', data => {
+  const st = document.getElementById('bypass-status');
+  if (st) { st.style.display = ''; st.textContent = data.msg; }
+  if (data.status === 'done') {
+    const btn = document.getElementById('bypass-btn');
+    if (btn) { btn.disabled = false; btn.textContent = 'Iniciar Bypass'; }
+    setTimeout(() => { if (st) st.style.display = 'none'; }, 5000);
+  }
+});
+
+socket.on('bypass_hit', entry => {
+  bypassHits.push(entry);
+  renderBypassHitsLive();
+});
+
+function renderBypassHitsLive() {
+  const el = document.getElementById('bypass-results');
+  if (!el) return;
+  const bypassed = bypassHits.filter(h => h.bypassed).length;
+  let html = `<div style="color:var(--text2);font-size:.78rem;margin-bottom:8px">${bypassHits.length} tecnicas probadas... <span style="color:var(--green);font-weight:600">${bypassed} bypassed</span></div>`;
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Tecnica</th><th>Status</th><th>Metodo</th><th>Tam.</th><th>Resultado</th></tr></thead><tbody>';
+  bypassHits.forEach(h => {
+    const sc = statusColor(h.status);
+    const badge = h.bypassed
+      ? '<span style="background:var(--green);color:#000;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:700">BYPASS</span>'
+      : h.error ? '<span style="color:var(--text3);font-size:.75rem">Error</span>'
+      : '<span style="color:var(--text3);font-size:.75rem">Bloqueado</span>';
+    html += `<tr style="${h.bypassed ? 'background:rgba(0,200,83,.06)' : ''}">
+      <td style="font-size:.8rem">${esc(h.technique)}</td>
+      <td><span style="color:${sc};font-weight:600">${h.status}</span></td>
+      <td style="color:var(--text2);font-size:.78rem">${esc(h.method || 'GET')}</td>
+      <td style="color:var(--text2);font-size:.78rem">${formatBytes(h.length)}</td>
+      <td>${badge}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+socket.on('bypass_result', data => {
+  const el = document.getElementById('bypass-results');
+  if (!el) return;
+
+  const results = data.results || [];
+  const bypassed = results.filter(r => r.bypassed);
+  const blocked = results.filter(r => !r.bypassed && !r.error);
+  const errors = results.filter(r => r.error);
+
+  let html = `<div style="display:flex;gap:10px;margin-bottom:16px">
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.1rem;font-weight:700;color:var(--orange)">${data.original_status}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Status Original</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.1rem;font-weight:700;color:var(--text2)">${data.total}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Tecnicas</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid ${bypassed.length ? 'var(--green)' : 'var(--border)'};border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.1rem;font-weight:700;color:var(--green)">${bypassed.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Bypassed</div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.1rem;font-weight:700;color:var(--red)">${blocked.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Bloqueados</div>
+    </div>
+  </div>`;
+
+  html += `<div style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+    <select id="bypass-filter" onchange="filterBypass()" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-size:.82rem;outline:none;cursor:pointer">
+      <option value="all">Todas las tecnicas</option>
+      <option value="bypassed">Solo bypassed</option>
+      <option value="blocked">Solo bloqueados</option>
+      <option value="diff">Status diferente al original</option>
+    </select>
+    <span style="color:var(--text3);font-size:.75rem">URL: ${esc(data.url)}</span>
+  </div>`;
+
+  html += '<div class="table-wrap"><table class="data-table" id="bypass-table"><thead><tr><th>Tecnica</th><th>URL / Headers</th><th>Metodo</th><th>Status</th><th>Tam.</th><th>Diff</th><th>Resultado</th></tr></thead><tbody>';
+  results.forEach(r => {
+    const sc = statusColor(r.status);
+    const badge = r.bypassed
+      ? '<span style="background:var(--green);color:#000;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:700">BYPASS</span>'
+      : r.error ? '<span style="color:var(--text3);font-size:.75rem">Error</span>'
+      : '<span style="color:var(--text3);font-size:.75rem">Bloqueado</span>';
+    const headerInfo = r.headers ? Object.entries(r.headers).map(([k,v]) => `${k}: ${v}`).join(', ') : '';
+    const urlDisplay = r.url || '';
+    const detail = headerInfo ? `<div style="font-family:monospace;font-size:.72rem;color:var(--accent);word-break:break-all">${esc(urlDisplay)}</div><div style="font-size:.7rem;color:var(--purple);margin-top:2px">${esc(headerInfo)}</div>` : `<div style="font-family:monospace;font-size:.72rem;color:var(--accent);word-break:break-all">${esc(urlDisplay)}</div>`;
+    const diffStr = r.diff_length > 0 ? `+${formatBytes(r.diff_length)}` : r.diff_length < 0 ? `-${formatBytes(Math.abs(r.diff_length))}` : '0';
+    const diffColor = r.diff_length !== 0 ? 'var(--yellow)' : 'var(--text3)';
+
+    html += `<tr class="bypass-row" data-bypassed="${r.bypassed}" data-status="${r.status}" data-orig="${data.original_status}" style="${r.bypassed ? 'background:rgba(0,200,83,.06)' : ''}">
+      <td style="font-size:.8rem;font-weight:${r.bypassed ? '600' : '400'}">${esc(r.technique)}</td>
+      <td>${detail}</td>
+      <td style="color:var(--text2);font-size:.78rem">${esc(r.method || 'GET')}</td>
+      <td><span style="color:${sc};font-weight:600">${r.status}</span></td>
+      <td style="color:var(--text2);font-size:.78rem">${formatBytes(r.length)}</td>
+      <td style="color:${diffColor};font-size:.78rem;font-weight:600">${diffStr}</td>
+      <td>${badge}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+});
+
+function filterBypass() {
+  const f = document.getElementById('bypass-filter')?.value || 'all';
+  document.querySelectorAll('.bypass-row').forEach(r => {
+    const bypassed = r.dataset.bypassed === 'true';
+    const status = parseInt(r.dataset.status);
+    const orig = parseInt(r.dataset.orig);
+    let show = true;
+    if (f === 'bypassed') show = bypassed;
+    else if (f === 'blocked') show = !bypassed;
+    else if (f === 'diff') show = status !== orig;
+    r.style.display = show ? '' : 'none';
+  });
 }
 
 // ── History ──

