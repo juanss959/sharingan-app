@@ -1203,9 +1203,12 @@ function renderFuzzHitsLive() {
   el.innerHTML = html;
 }
 
+let lastFuzzData = null;
+
 function renderFuzzResults(data) {
   const el = document.getElementById('fuzz-results');
   if (!el) return;
+  lastFuzzData = data;
 
   const found = data.found || [];
   if (!found.length) {
@@ -1252,9 +1255,12 @@ function renderFuzzResults(data) {
       <option value="interesting">Interesantes (200, 301, 302, 500+)</option>
       ${statusKeys.map(s => `<option value="${s}">Solo ${s} (${statusCounts[s]})</option>`).join('')}
     </select>
+    <button onclick="verifyWithHttpx()" id="httpx-verify-btn" style="background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border:none;border-radius:8px;padding:7px 14px;font-weight:600;cursor:pointer;font-size:.8rem;white-space:nowrap">Verificar con httpx</button>
     <span style="color:var(--text3);font-size:.75rem">Metodo: ${esc(data.method || 'auto')}</span>
+    ${data.filtered_count ? `<span style="color:var(--yellow);font-size:.72rem">${data.filtered_count} descartados (catch-all ${data.catch_all_size || ''}B)</span>` : ''}
   </div>`;
 
+  html += '<div id="httpx-results" style="margin-bottom:12px"></div>';
   html += '<div id="fuzz-visible-count" style="color:var(--text3);font-size:.72rem;margin-bottom:6px"></div>';
   html += '<div class="table-wrap"><table class="data-table" id="fuzz-table"><thead><tr><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th><th>Redirect</th></tr></thead><tbody>';
   found.forEach(f => {
@@ -1294,6 +1300,58 @@ function filterFuzz() {
   const counter = document.getElementById('fuzz-visible-count');
   if (counter) counter.textContent = `${visible} resultados visibles`;
 }
+
+function verifyWithHttpx() {
+  if (!lastFuzzData || !lastFuzzData.found || !lastFuzzData.found.length) return;
+  const urls = lastFuzzData.found.map(f => f.url).filter(Boolean);
+  const btn = document.getElementById('httpx-verify-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Verificando...'; }
+  const el = document.getElementById('httpx-results');
+  if (el) el.innerHTML = '<div style="color:var(--accent);font-size:.8rem;padding:8px">Enviando a httpx...</div>';
+  socket.emit('start_httpx_verify', { urls });
+}
+
+socket.on('httpx_status', data => {
+  const el = document.getElementById('httpx-results');
+  if (el && data.status === 'running') {
+    el.innerHTML = `<div style="color:var(--accent);font-size:.8rem;padding:8px">${esc(data.msg)}</div>`;
+  }
+  if (data.status === 'done') {
+    const btn = document.getElementById('httpx-verify-btn');
+    if (btn) { btn.disabled = false; btn.textContent = 'Verificar con httpx'; }
+  }
+});
+
+socket.on('httpx_result', data => {
+  const el = document.getElementById('httpx-results');
+  if (!el) return;
+  const results = data.results || [];
+  if (!results.length) {
+    el.innerHTML = '<div style="color:var(--text2);font-size:.8rem;padding:8px">httpx no devolvio resultados (ninguna URL respondio).</div>';
+    return;
+  }
+  let html = `<div style="background:var(--bg2);border:1px solid var(--accent);border-radius:10px;padding:12px;margin-bottom:8px">
+    <div style="font-weight:600;font-size:.85rem;margin-bottom:8px;color:var(--accent)">Verificado con httpx: ${data.total} URLs, ${data.real} probablemente reales</div>
+    <div style="color:var(--text3);font-size:.72rem;margin-bottom:8px">Las marcadas en verde tienen tamaño unico (contenido distinto). Las grises comparten tamaño con muchas = posible catch-all residual.</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>URL</th><th>Status</th><th>Tam.</th><th>Title</th><th>Server / Tech</th><th>Real?</th></tr></thead><tbody>`;
+  results.forEach(r => {
+    const sc = statusColor(r.status);
+    const realBadge = r.likely_real
+      ? '<span style="background:var(--green);color:#000;padding:1px 7px;border-radius:4px;font-size:.68rem;font-weight:700">REAL</span>'
+      : `<span style="color:var(--text3);font-size:.7rem">x${r.dup_count} igual</span>`;
+    const servTech = [r.server, r.tech].filter(Boolean).join(' / ');
+    html += `<tr style="${r.likely_real ? 'background:rgba(0,200,83,.05)' : 'opacity:.6'}">
+      <td><a href="${esc(r.url)}" target="_blank" style="color:var(--accent);font-family:monospace;font-size:.76rem;text-decoration:none;word-break:break-all">${esc(r.url)}</a></td>
+      <td><span style="color:${sc};font-weight:600">${r.status}</span></td>
+      <td style="color:var(--text2);font-size:.76rem">${formatBytes(r.length)}</td>
+      <td style="color:var(--text);font-size:.76rem">${esc(r.title || '')}</td>
+      <td style="color:var(--text2);font-size:.72rem">${esc(servTech)}</td>
+      <td>${realBadge}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div></div>';
+  el.innerHTML = html;
+});
 
 function statusColor(code) {
   if (code >= 200 && code < 300) return 'var(--green)';

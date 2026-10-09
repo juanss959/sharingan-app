@@ -1402,14 +1402,49 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
     tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-fuzz-{int(time.time())}"
     tmpdir.mkdir(parents=True, exist_ok=True)
 
+    # ── Calibracion: detectar respuesta catch-all (SPA / soft-404) ──
+    # Sitios como Vercel/Next.js devuelven 200 con la misma pagina para
+    # cualquier ruta inexistente. Pedimos rutas aleatorias para aprender
+    # ese tamaño y luego filtrarlo.
+    import random, string
+    calib_sizes = []
+    calib_status = None
+    socketio.emit("fuzz_status", {"status": "running", "msg": "Calibrando (detectando catch-all)..."})
+    for _ in range(3):
+        rand_path = ''.join(random.choices(string.ascii_lowercase + string.digits, k=24))
+        try:
+            cr = requests.get(f"{url}/{rand_path}", timeout=8, allow_redirects=False,
+                              headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+            calib_status = cr.status_code
+            if cr.status_code not in (404, 400):
+                calib_sizes.append(len(cr.content))
+        except Exception:
+            pass
+
+    # Si rutas aleatorias devuelven 2xx/3xx con tamaño consistente, es un catch-all
+    catch_all_size = None
+    if calib_sizes and calib_status not in (404, 400):
+        if len(set(calib_sizes)) == 1:
+            catch_all_size = calib_sizes[0]
+        else:
+            catch_all_size = max(set(calib_sizes), key=calib_sizes.count)
+
+    if catch_all_size is not None:
+        socketio.emit("fuzz_status", {
+            "status": "running",
+            "msg": f"Catch-all detectado (status {calib_status}, {catch_all_size}B) - se filtrara"
+        })
+
     if use_ffuf and wordlist_path:
         results["method"] = "ffuf"
+        results["catch_all_size"] = catch_all_size
         socketio.emit("fuzz_status", {"status": "running", "msg": "Ejecutando ffuf..."})
 
         output_file = tmpdir / "ffuf.json"
         ext_flag = f' -e .{",".join(extensions)}' if extensions else ''
+        fs_flag = f' -fs {catch_all_size}' if catch_all_size is not None else ''
         cmd = (f'ffuf -u "{url}/FUZZ" -w "{wordlist_path}" '
-               f'-o "{output_file}" -of json -mc all -fc 404 '
+               f'-o "{output_file}" -of json -mc all -fc 404{fs_flag} '
                f'-t {threads} -timeout 10 -ac{ext_flag} -s')
 
         run_cmd(cmd)
@@ -1417,11 +1452,33 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
         if output_file.exists():
             try:
                 data = json.loads(output_file.read_text(encoding='utf-8', errors='replace'))
-                for r in data.get("results", []):
+                raw = data.get("results", []) or []
+                results["total_requests"] = data.get("numberofRequests", len(raw))
+
+                # Red de seguridad: si un mismo tamaño domina (>40% y >20 hits),
+                # casi seguro es el catch-all que -fs no atrapo por variaciones.
+                length_counts = {}
+                for r in raw:
+                    length_counts[r.get("length", 0)] = length_counts.get(r.get("length", 0), 0) + 1
+                dominant = None
+                if raw:
+                    top_len, top_count = max(length_counts.items(), key=lambda x: x[1])
+                    if top_count > 20 and top_count / len(raw) > 0.4:
+                        dominant = top_len
+
+                filtered = 0
+                for r in raw:
+                    rlen = r.get("length", 0)
+                    if catch_all_size is not None and rlen == catch_all_size:
+                        filtered += 1
+                        continue
+                    if dominant is not None and rlen == dominant:
+                        filtered += 1
+                        continue
                     entry = {
                         "url": r.get("url", ""),
                         "status": r.get("status", 0),
-                        "length": r.get("length", 0),
+                        "length": rlen,
                         "words": r.get("words", 0),
                         "lines": r.get("lines", 0),
                         "path": r.get("input", {}).get("FUZZ", ""),
@@ -1431,7 +1488,7 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
                             r.get("redirectlocation", ""))
                     }
                     results["found"].append(entry)
-                results["total_requests"] = data.get("numberofRequests", len(results["found"]))
+                results["filtered_count"] = filtered
             except Exception:
                 pass
     else:
@@ -1457,7 +1514,8 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
                 test_url = f"{url}/{path}"
                 resp = requests.get(test_url, timeout=5, allow_redirects=False,
                                     headers={"User-Agent": "Mozilla/5.0"}, verify=False)
-                if resp.status_code != 404:
+                if resp.status_code != 404 and not (
+                        catch_all_size is not None and len(resp.content) == catch_all_size):
                     redir = resp.headers.get("Location", "")
                     entry = {
                         "url": test_url,
@@ -1477,10 +1535,11 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
 
     results["found"].sort(key=lambda x: (x["status"], x["path"]))
     socketio.emit("fuzz_result", results)
-    socketio.emit("fuzz_status", {
-        "status": "done",
-        "msg": f"Fuzzing completado: {len(results['found'])} encontrados"
-    })
+    filt = results.get("filtered_count", 0)
+    done_msg = f"Fuzzing completado: {len(results['found'])} encontrados"
+    if filt:
+        done_msg += f" ({filt} descartados como catch-all)"
+    socketio.emit("fuzz_status", {"status": "done", "msg": done_msg})
 
     import shutil
     try:
@@ -1691,6 +1750,80 @@ def handle_fuzzing(data):
     if not wordlist or not Path(wordlist).exists():
         wordlist = find_wordlist()
     threading.Thread(target=run_fuzzing, args=(url, extensions, threads, wordlist), daemon=True).start()
+
+
+# ── httpx verification (enriquece resultados del fuzzing) ──
+
+def run_httpx_verify(urls):
+    socketio.emit("httpx_status", {"status": "running", "msg": f"Verificando {len(urls)} URLs con httpx..."})
+
+    tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-httpx-{int(time.time())}"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    in_file = tmpdir / "urls.txt"
+    out_file = tmpdir / "httpx.json"
+    in_file.write_text("\n".join(urls), encoding="utf-8")
+
+    cmd = (f'httpx -l "{in_file}" -json -o "{out_file}" '
+           f'-sc -cl -title -td -server -location -ct -nc -silent -t 50')
+    run_cmd(cmd)
+
+    enriched = []
+    if out_file.exists():
+        for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                j = json.loads(line)
+                tech = j.get("tech", [])
+                enriched.append({
+                    "url": j.get("url", ""),
+                    "path": j.get("path", "") or j.get("input", ""),
+                    "status": j.get("status_code", 0),
+                    "length": j.get("content_length", 0),
+                    "title": j.get("title", ""),
+                    "server": j.get("webserver", ""),
+                    "tech": ", ".join(tech) if isinstance(tech, list) else (tech or ""),
+                    "content_type": j.get("content_type", ""),
+                    "location": j.get("location", ""),
+                })
+            except Exception:
+                continue
+
+    # Agrupar por content-length: los que comparten tamaño con muchos otros
+    # son probablemente la misma pagina (catch-all residual).
+    len_counts = {}
+    for e in enriched:
+        len_counts[e["length"]] = len_counts.get(e["length"], 0) + 1
+    for e in enriched:
+        e["dup_count"] = len_counts.get(e["length"], 1)
+        e["likely_real"] = e["dup_count"] <= 3
+
+    enriched.sort(key=lambda x: (not x["likely_real"], x["status"], x["path"]))
+
+    socketio.emit("httpx_result", {
+        "results": enriched,
+        "total": len(enriched),
+        "real": sum(1 for e in enriched if e["likely_real"]),
+    })
+    real_n = sum(1 for e in enriched if e["likely_real"])
+    socketio.emit("httpx_status", {
+        "status": "done",
+        "msg": f"Verificacion completa: {len(enriched)} verificadas, {real_n} probablemente reales"
+    })
+
+    import shutil
+    try:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+@socketio.on("start_httpx_verify")
+def handle_httpx_verify(data):
+    urls = data.get("urls", [])
+    urls = [u for u in urls if u and u.startswith("http")][:3000]
+    if not urls:
+        socketio.emit("httpx_status", {"status": "done", "msg": "No hay URLs para verificar"})
+        return
+    threading.Thread(target=run_httpx_verify, args=(urls,), daemon=True).start()
 
 
 def update_scan(scan_id, **kwargs):
