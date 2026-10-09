@@ -1754,66 +1754,141 @@ def handle_fuzzing(data):
 
 # ── httpx verification (enriquece resultados del fuzzing) ──
 
-def run_httpx_verify(urls):
-    socketio.emit("httpx_status", {"status": "running", "msg": f"Verificando {len(urls)} URLs con httpx..."})
-
-    tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-httpx-{int(time.time())}"
-    tmpdir.mkdir(parents=True, exist_ok=True)
-    in_file = tmpdir / "urls.txt"
-    out_file = tmpdir / "httpx.json"
-    in_file.write_text("\n".join(urls), encoding="utf-8")
-
-    cmd = (f'httpx -l "{in_file}" -json -o "{out_file}" '
-           f'-sc -cl -title -td -server -location -ct -nc -silent -t 50')
-    run_cmd(cmd)
-
-    enriched = []
-    if out_file.exists():
-        for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                j = json.loads(line)
-                tech = j.get("tech", [])
-                enriched.append({
-                    "url": j.get("url", ""),
-                    "path": j.get("path", "") or j.get("input", ""),
-                    "status": j.get("status_code", 0),
-                    "length": j.get("content_length", 0),
-                    "title": j.get("title", ""),
-                    "server": j.get("webserver", ""),
-                    "tech": ", ".join(tech) if isinstance(tech, list) else (tech or ""),
-                    "content_type": j.get("content_type", ""),
-                    "location": j.get("location", ""),
-                })
-            except Exception:
-                continue
-
-    # Agrupar por content-length: los que comparten tamaño con muchos otros
-    # son probablemente la misma pagina (catch-all residual).
-    len_counts = {}
-    for e in enriched:
-        len_counts[e["length"]] = len_counts.get(e["length"], 0) + 1
-    for e in enriched:
-        e["dup_count"] = len_counts.get(e["length"], 1)
-        e["likely_real"] = e["dup_count"] <= 3
-
-    enriched.sort(key=lambda x: (not x["likely_real"], x["status"], x["path"]))
-
-    socketio.emit("httpx_result", {
-        "results": enriched,
-        "total": len(enriched),
-        "real": sum(1 for e in enriched if e["likely_real"]),
-    })
-    real_n = sum(1 for e in enriched if e["likely_real"])
-    socketio.emit("httpx_status", {
-        "status": "done",
-        "msg": f"Verificacion completa: {len(enriched)} verificadas, {real_n} probablemente reales"
-    })
-
-    import shutil
+def _httpx_available():
+    """Detecta si httpx.exe se puede ejecutar (no bloqueado por Device Guard)."""
     try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        r = subprocess.run("httpx -version", shell=True, capture_output=True,
+                           text=True, timeout=10, env=get_env())
+        out = (r.stdout + r.stderr).lower()
+        if "bloqueado" in out or "device guard" in out or "blocked" in out:
+            return False
+        return r.returncode == 0 or "version" in out
     except Exception:
-        pass
+        return False
+
+
+def _verify_url_python(url, session):
+    """Fallback: obtiene status, tamaño, title, server via requests."""
+    try:
+        resp = session.get(url, timeout=8, allow_redirects=True,
+                           headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+        body = resp.text
+        title = ""
+        m = re.search(r'<title[^>]*>(.*?)</title>', body, re.IGNORECASE | re.DOTALL)
+        if m:
+            title = re.sub(r'\s+', ' ', m.group(1)).strip()[:120]
+        tech = []
+        gen = re.search(r'<meta[^>]*name=["\']generator["\'][^>]*content=["\'](.*?)["\']', body, re.IGNORECASE)
+        if gen:
+            tech.append(gen.group(1)[:40])
+        if 'wp-content' in body or 'wp-includes' in body:
+            tech.append("WordPress")
+        if '/_next/' in body or '__NEXT_DATA__' in body:
+            tech.append("Next.js")
+        return {
+            "url": url,
+            "path": re.sub(r'https?://[^/]+', '', url),
+            "status": resp.status_code,
+            "length": len(resp.content),
+            "title": title,
+            "server": resp.headers.get("Server", ""),
+            "tech": ", ".join(dict.fromkeys(tech)),
+            "content_type": resp.headers.get("Content-Type", "").split(';')[0],
+            "location": resp.headers.get("Location", ""),
+        }
+    except Exception:
+        return None
+
+
+def run_httpx_verify(urls):
+    enriched = []
+    tmpdir = None
+    try:
+        use_httpx = _httpx_available()
+
+        if use_httpx:
+            socketio.emit("httpx_status", {"status": "running", "msg": f"Verificando {len(urls)} URLs con httpx..."})
+            tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-httpx-{int(time.time())}"
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            in_file = tmpdir / "urls.txt"
+            out_file = tmpdir / "httpx.json"
+            in_file.write_text("\n".join(urls), encoding="utf-8")
+
+            cmd = (f'httpx -l "{in_file}" -json -o "{out_file}" '
+                   f'-sc -cl -title -td -server -location -ct -nc -silent -t 50')
+            run_cmd(cmd)
+
+            if out_file.exists():
+                for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        j = json.loads(line)
+                        tech = j.get("tech", [])
+                        enriched.append({
+                            "url": j.get("url", ""),
+                            "path": j.get("path", "") or j.get("input", ""),
+                            "status": j.get("status_code", 0),
+                            "length": j.get("content_length", 0),
+                            "title": j.get("title", ""),
+                            "server": j.get("webserver", ""),
+                            "tech": ", ".join(tech) if isinstance(tech, list) else (tech or ""),
+                            "content_type": j.get("content_type", ""),
+                            "location": j.get("location", ""),
+                        })
+                    except Exception:
+                        continue
+        else:
+            # Fallback Python (httpx bloqueado por Device Guard o no disponible)
+            socketio.emit("httpx_status", {
+                "status": "running",
+                "msg": f"httpx no disponible (bloqueado) - verificando {len(urls)} URLs con Python..."
+            })
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            session = requests.Session()
+            session.headers.update({"User-Agent": "Mozilla/5.0"})
+            done = 0
+            with ThreadPoolExecutor(max_workers=30) as pool:
+                futures = {pool.submit(_verify_url_python, u, session): u for u in urls}
+                for fut in as_completed(futures):
+                    done += 1
+                    if done % 25 == 0:
+                        socketio.emit("httpx_status", {
+                            "status": "running",
+                            "msg": f"Verificadas {done}/{len(urls)} URLs..."
+                        })
+                    r = fut.result()
+                    if r:
+                        enriched.append(r)
+
+        # Agrupar por content-length: los que comparten tamaño con muchos otros
+        # son probablemente la misma pagina (catch-all residual).
+        len_counts = {}
+        for e in enriched:
+            len_counts[e["length"]] = len_counts.get(e["length"], 0) + 1
+        for e in enriched:
+            e["dup_count"] = len_counts.get(e["length"], 1)
+            e["likely_real"] = e["dup_count"] <= 3
+
+        enriched.sort(key=lambda x: (not x["likely_real"], x["status"], x["path"]))
+        real_n = sum(1 for e in enriched if e["likely_real"])
+
+        socketio.emit("httpx_result", {
+            "results": enriched,
+            "total": len(enriched),
+            "real": real_n,
+        })
+        socketio.emit("httpx_status", {
+            "status": "done",
+            "msg": f"Verificacion completa: {len(enriched)} verificadas, {real_n} probablemente reales"
+        })
+    except Exception as e:
+        socketio.emit("httpx_status", {"status": "done", "msg": f"Error en verificacion: {e}"})
+    finally:
+        if tmpdir:
+            import shutil
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 @socketio.on("start_httpx_verify")
