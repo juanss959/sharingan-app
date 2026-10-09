@@ -1455,24 +1455,34 @@ def run_fuzzing(url, extensions, threads, wordlist_path):
                 raw = data.get("results", []) or []
                 results["total_requests"] = data.get("numberofRequests", len(raw))
 
-                # Red de seguridad: si un mismo tamaño domina (>40% y >20 hits),
-                # casi seguro es el catch-all que -fs no atrapo por variaciones.
-                length_counts = {}
+                # ── Filtro por fingerprint de estructura (status, words, lines) ──
+                # Una SPA que refleja el path devuelve respuestas de TAMAÑO distinto
+                # (bytes varian) pero MISMA estructura: igual numero de palabras y
+                # lineas. Agrupamos por ese fingerprint y descartamos los clusters
+                # que dominan (= el mismo template catch-all repetido).
+                total_raw = len(raw)
+                fp_counts = {}
                 for r in raw:
-                    length_counts[r.get("length", 0)] = length_counts.get(r.get("length", 0), 0) + 1
-                dominant = None
-                if raw:
-                    top_len, top_count = max(length_counts.items(), key=lambda x: x[1])
-                    if top_count > 20 and top_count / len(raw) > 0.4:
-                        dominant = top_len
+                    fp = (r.get("status", 0), r.get("words", 0), r.get("lines", 0))
+                    fp_counts[fp] = fp_counts.get(fp, 0) + 1
+
+                # Un fingerprint es "catch-all" si aparece muchas veces:
+                # >15 hits y >5% del total, o simplemente >200 hits.
+                catchall_fps = set()
+                for fp, c in fp_counts.items():
+                    if c > 200 or (c > 15 and total_raw and c / total_raw > 0.05):
+                        catchall_fps.add(fp)
 
                 filtered = 0
                 for r in raw:
                     rlen = r.get("length", 0)
+                    fp = (r.get("status", 0), r.get("words", 0), r.get("lines", 0))
+                    # Descartar por tamaño exacto del catch-all calibrado
                     if catch_all_size is not None and rlen == catch_all_size:
                         filtered += 1
                         continue
-                    if dominant is not None and rlen == dominant:
+                    # Descartar por fingerprint de estructura dominante
+                    if fp in catchall_fps:
                         filtered += 1
                         continue
                     entry = {
@@ -1790,6 +1800,8 @@ def _verify_url_python(url, session):
             "path": re.sub(r'https?://[^/]+', '', url),
             "status": resp.status_code,
             "length": len(resp.content),
+            "words": len(body.split()),
+            "lines": len(body.splitlines()),
             "title": title,
             "server": resp.headers.get("Server", ""),
             "tech": ", ".join(dict.fromkeys(tech)),
@@ -1828,6 +1840,8 @@ def run_httpx_verify(urls):
                             "path": j.get("path", "") or j.get("input", ""),
                             "status": j.get("status_code", 0),
                             "length": j.get("content_length", 0),
+                            "words": j.get("words", 0),
+                            "lines": j.get("lines", 0),
                             "title": j.get("title", ""),
                             "server": j.get("webserver", ""),
                             "tech": ", ".join(tech) if isinstance(tech, list) else (tech or ""),
@@ -1859,13 +1873,16 @@ def run_httpx_verify(urls):
                     if r:
                         enriched.append(r)
 
-        # Agrupar por content-length: los que comparten tamaño con muchos otros
-        # son probablemente la misma pagina (catch-all residual).
-        len_counts = {}
+        # Agrupar por fingerprint de estructura (status, words, lines): una SPA
+        # que refleja el path varia en bytes pero mantiene igual estructura.
+        # Los que comparten fingerprint con muchos otros son el catch-all.
+        fp_counts = {}
         for e in enriched:
-            len_counts[e["length"]] = len_counts.get(e["length"], 0) + 1
+            fp = (e["status"], e.get("words", 0), e.get("lines", 0))
+            fp_counts[fp] = fp_counts.get(fp, 0) + 1
         for e in enriched:
-            e["dup_count"] = len_counts.get(e["length"], 1)
+            fp = (e["status"], e.get("words", 0), e.get("lines", 0))
+            e["dup_count"] = fp_counts.get(fp, 1)
             e["likely_real"] = e["dup_count"] <= 3
 
         enriched.sort(key=lambda x: (not x["likely_real"], x["status"], x["path"]))
