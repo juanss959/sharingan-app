@@ -1366,7 +1366,7 @@ function renderBypassHitsLive() {
   if (!el) return;
   const bypassed = bypassHits.filter(h => h.bypassed).length;
   let html = `<div style="color:var(--text2);font-size:.78rem;margin-bottom:8px">${bypassHits.length} tecnicas probadas... <span style="color:var(--green);font-weight:600">${bypassed} bypassed</span></div>`;
-  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Tecnica</th><th>Status</th><th>Metodo</th><th>Tam.</th><th>Resultado</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Tecnica</th><th>Status</th><th>Metodo</th><th>Tam.</th><th>Resultado</th><th>Motivo</th></tr></thead><tbody>';
   bypassHits.forEach(h => {
     const sc = statusColor(h.status);
     const badge = h.bypassed
@@ -1379,6 +1379,7 @@ function renderBypassHitsLive() {
       <td style="color:var(--text2);font-size:.78rem">${esc(h.method || 'GET')}</td>
       <td style="color:var(--text2);font-size:.78rem">${formatBytes(h.length)}</td>
       <td>${badge}</td>
+      <td style="color:var(--text3);font-size:.72rem">${esc(h.note || '')}</td>
     </tr>`;
   });
   html += '</tbody></table></div>';
@@ -1423,7 +1424,7 @@ socket.on('bypass_result', data => {
     <span style="color:var(--text3);font-size:.75rem">URL: ${esc(data.url)}</span>
   </div>`;
 
-  html += '<div class="table-wrap"><table class="data-table" id="bypass-table"><thead><tr><th>Tecnica</th><th>URL / Headers</th><th>Metodo</th><th>Status</th><th>Tam.</th><th>Diff</th><th>Resultado</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table" id="bypass-table"><thead><tr><th>Tecnica</th><th>URL / Headers</th><th>Metodo</th><th>Status</th><th>Tam.</th><th>Resultado</th><th>Motivo</th></tr></thead><tbody>';
   results.forEach(r => {
     const sc = statusColor(r.status);
     const badge = r.bypassed
@@ -1433,8 +1434,6 @@ socket.on('bypass_result', data => {
     const headerInfo = r.headers ? Object.entries(r.headers).map(([k,v]) => `${k}: ${v}`).join(', ') : '';
     const urlDisplay = r.url || '';
     const detail = headerInfo ? `<div style="font-family:monospace;font-size:.72rem;color:var(--accent);word-break:break-all">${esc(urlDisplay)}</div><div style="font-size:.7rem;color:var(--purple);margin-top:2px">${esc(headerInfo)}</div>` : `<div style="font-family:monospace;font-size:.72rem;color:var(--accent);word-break:break-all">${esc(urlDisplay)}</div>`;
-    const diffStr = r.diff_length > 0 ? `+${formatBytes(r.diff_length)}` : r.diff_length < 0 ? `-${formatBytes(Math.abs(r.diff_length))}` : '0';
-    const diffColor = r.diff_length !== 0 ? 'var(--yellow)' : 'var(--text3)';
 
     html += `<tr class="bypass-row" data-bypassed="${r.bypassed}" data-status="${r.status}" data-orig="${data.original_status}" style="${r.bypassed ? 'background:rgba(0,200,83,.06)' : ''}">
       <td style="font-size:.8rem;font-weight:${r.bypassed ? '600' : '400'}">${esc(r.technique)}</td>
@@ -1442,8 +1441,8 @@ socket.on('bypass_result', data => {
       <td style="color:var(--text2);font-size:.78rem">${esc(r.method || 'GET')}</td>
       <td><span style="color:${sc};font-weight:600">${r.status}</span></td>
       <td style="color:var(--text2);font-size:.78rem">${formatBytes(r.length)}</td>
-      <td style="color:${diffColor};font-size:.78rem;font-weight:600">${diffStr}</td>
       <td>${badge}</td>
+      <td style="color:var(--text3);font-size:.72rem">${esc(r.note || '')}</td>
     </tr>`;
   });
   html += '</tbody></table></div>';

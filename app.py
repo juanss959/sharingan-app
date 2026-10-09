@@ -1544,6 +1544,16 @@ def run_403_bypass(url):
     except Exception:
         original_length = 0
 
+    # Baseline de la home page, para descartar falsos positivos
+    # (tecnicas de header que terminan sirviendo la portada en vez del recurso)
+    homepage_length = None
+    try:
+        hp = session.get(base + "/", timeout=10, allow_redirects=True)
+        if hp.status_code == 200:
+            homepage_length = len(hp.content)
+    except Exception:
+        pass
+
     socketio.emit("bypass_status", {
         "status": "running",
         "msg": f"Status original: {original_status} | Probando {total} tecnicas..."
@@ -1591,10 +1601,31 @@ def run_403_bypass(url):
             resp = session.request(method, test_url, headers=headers, timeout=8, allow_redirects=False)
             status = resp.status_code
             length = len(resp.content)
+            redirect_to = resp.headers.get("Location", "")
 
+            # ── Deteccion precisa de bypass ──
+            # Solo cuenta como bypass real si el recurso estaba protegido (401/403)
+            # y ahora responde con contenido real (2xx) que NO es la home page.
             bypassed = False
-            if original_status and original_status == 403:
-                bypassed = status == 200 or (status != 403 and status != 404 and status < 500)
+            note = ""
+            if original_status in (401, 403):
+                if 200 <= status < 300:
+                    is_homepage = (homepage_length is not None and
+                                   abs(length - homepage_length) < 50)
+                    if is_homepage:
+                        note = "Falso positivo: sirvio la home, no el recurso"
+                    elif length == 0:
+                        note = "200 pero cuerpo vacio"
+                    else:
+                        bypassed = True
+                elif 300 <= status < 400:
+                    note = f"Redirect -> {redirect_to[:80]}" if redirect_to else "Redirect (no es acceso)"
+                elif status == original_status:
+                    note = "Sigue bloqueado"
+                elif status == 404:
+                    note = "No encontrado"
+                else:
+                    note = f"Status {status}"
 
             entry = {
                 "technique": tech["name"],
@@ -1603,6 +1634,8 @@ def run_403_bypass(url):
                 "status": status,
                 "length": length,
                 "bypassed": bypassed,
+                "note": note,
+                "redirect": redirect_to[:120] if redirect_to else "",
                 "headers": headers if headers else None,
                 "diff_length": length - original_length if original_length else 0,
             }
