@@ -170,6 +170,16 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 
 .section-title{font-size:.92rem;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:10px}
 .section-title .icon{font-size:1.05rem}
+@media print {
+  .sidebar, .content-header, .no-print { display: none !important; }
+  .content, .content-body { margin: 0 !important; padding: 0 !important; }
+  body { background: #fff !important; color: #000 !important; }
+  #report-doc, #report-doc * { color: #000 !important; }
+  #report-doc { background: #fff !important; }
+  #report-doc table, #report-doc th, #report-doc td { border: 1px solid #999 !important; border-collapse: collapse; }
+  #report-doc .data-table { width: 100%; }
+  @page { margin: 1.5cm; }
+}
 </style>
 </head>
 <body>
@@ -229,6 +239,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       </div>
       <div class="nav-item disabled" data-mod="assets" onclick="showModule('assets')">
         <span class="icon">🧩</span><span class="label">Activos</span><span class="badge">0</span>
+      </div>
+      <div class="nav-item disabled" data-mod="report" onclick="showModule('report')">
+        <span class="icon">📄</span><span class="label">Informe</span>
       </div>
       <div class="sidebar-divider"></div>
       <div class="nav-item disabled" data-mod="js_secrets" onclick="showModule('js_secrets')">
@@ -290,6 +303,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div id="view-dirs" style="display:none"></div>
       <div id="view-urls" style="display:none"></div>
       <div id="view-assets" style="display:none"></div>
+      <div id="view-report" style="display:none"></div>
       <div id="view-js_secrets" style="display:none"></div>
       <div id="view-fuzzing" style="display:none"></div>
       <div id="view-bypass403" style="display:none"></div>
@@ -390,6 +404,12 @@ function showModule(mod) {
     loadAssets(currentScanId);
     return;
   }
+  if (mod === 'report') {
+    setHeader('📄 Informe', statusH);
+    document.getElementById('view-report').style.display = '';
+    loadReport(currentScanId);
+    return;
+  }
   if (mod === 'overview') {
     setHeader(domainH, statusH);
     renderOverview(scan);
@@ -468,6 +488,112 @@ function renderAssetDetail(a) {
 function toggleAssetDetail(i) {
   const r = document.getElementById('asset-detail-' + i);
   if (r) r.style.display = r.style.display === 'none' ? '' : 'none';
+}
+
+// ── Informe / reportes ──
+let _reportData = null;
+async function loadReport(scanId) {
+  const el = document.getElementById('view-report');
+  el.innerHTML = '<div style="color:var(--text3);padding:12px">Generando informe...</div>';
+  try {
+    const res = await fetch(`/api/scans/${scanId}/report`);
+    _reportData = await res.json();
+    renderReportView(_reportData);
+  } catch (e) {
+    el.innerHTML = '<div class="empty-state"><h3>Error</h3><p>No se pudo generar el informe.</p></div>';
+  }
+}
+
+function _fRows(list) {
+  if (!list.length) return '<div style="color:var(--text3);font-size:.8rem;padding:6px">Ninguno.</div>';
+  return `<table class="data-table"><thead><tr><th>Validación</th><th>Tipo</th><th>Host</th><th>Hallazgo</th><th>Sev.</th><th>Ubicación</th></tr></thead><tbody>${
+    list.map(f => `<tr>
+      <td>${validationBadge(f.validation_status,'')}</td>
+      <td style="font-size:.72rem">${esc(f.finding_type)}</td>
+      <td style="font-family:monospace;font-size:.74rem;color:var(--accent)">${esc(f.canonical_host||'')}</td>
+      <td style="font-size:.76rem">${esc(f.name||'')}</td>
+      <td style="font-size:.72rem">${esc(f.severity||'')}</td>
+      <td style="font-size:.7rem;color:var(--text3);word-break:break-all">${esc(f.location||'')}</td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+function renderReportView(rep) {
+  const el = document.getElementById('view-report');
+  const s = rep.scan || {}, st = rep.stats || {}, fn = rep.findings || {};
+  const verified = fn.verified || [], probable = fn.probable || [], incon = fn.inconclusive || [];
+  el.innerHTML = `
+    <div style="display:flex;gap:8px;margin-bottom:14px" class="no-print">
+      <button onclick="window.print()" style="background:linear-gradient(135deg,#c62828,var(--red));color:#fff;border:none;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer;font-size:.82rem">📄 PDF / Imprimir</button>
+      <button onclick="exportReportJson()" style="background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.82rem">Exportar JSON</button>
+      <button onclick="exportReportCsv()" style="background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.82rem">Exportar CSV</button>
+    </div>
+    <div id="report-doc">
+      <div class="section-title"><span class="icon">📄</span>Informe de reconocimiento — ${esc(s.domain||'')}</div>
+      <div style="color:var(--text3);font-size:.76rem;margin-bottom:14px">
+        Objetivo: <b>${esc(s.domain||'')}</b> · Estado: ${esc(s.status||'')} ·
+        Inicio: ${esc(s.started_at||'-')} · Fin: ${esc(s.finished_at||'-')}
+      </div>
+
+      <h3 style="font-size:.95rem;margin:14px 0 6px">1. Resumen ejecutivo</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        ${[['Subdominios',st.subdomains],['Resuelven',st.resolved],['Wildcard',st.wildcard],['Hosts vivos',st.alive],['Puertos',st.ports],['Activos',st.assets],['Vulns',st.vulns],['Directorios',st.dirs]].map(([k,v])=>
+          `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 14px;text-align:center;min-width:72px"><div style="font-size:1.1rem;font-weight:700;color:var(--accent)">${v||0}</div><div style="font-size:.62rem;color:var(--text3);text-transform:uppercase">${k}</div></div>`).join('')}
+      </div>
+      <div style="font-size:.8rem;color:var(--text2);margin-bottom:6px">
+        <b style="color:var(--green)">${verified.length}</b> hallazgo(s) verificado(s) · <b style="color:var(--yellow)">${probable.length}</b> observación(es) probable(s).
+      </div>
+
+      <h3 style="font-size:.95rem;margin:16px 0 6px;color:var(--green)">2. Hallazgos verificados (confirmados)</h3>
+      ${_fRows(verified)}
+
+      <h3 style="font-size:.95rem;margin:16px 0 6px;color:var(--yellow)">3. Observaciones (probables — requieren validación manual)</h3>
+      ${_fRows(probable)}
+      ${incon.length ? `<h3 style="font-size:.95rem;margin:16px 0 6px;color:var(--text2)">No concluyentes</h3>${_fRows(incon)}` : ''}
+
+      <h3 style="font-size:.95rem;margin:16px 0 6px">4. Superficie de ataque (activos)</h3>
+      <table class="data-table"><thead><tr><th>Host</th><th>IP</th><th>Puertos</th><th>Tech</th><th>Flags</th></tr></thead><tbody>
+      ${(rep.assets||[]).map(a=>`<tr>
+        <td style="font-family:monospace;font-size:.76rem;color:var(--accent)">${esc(a.canonical_host)}</td>
+        <td style="font-size:.72rem;color:var(--text2)">${esc(a.ip||'-')}</td>
+        <td style="font-size:.74rem">${(a.ports||[]).map(p=>p.port).join(', ')||'-'}</td>
+        <td style="font-size:.72rem;color:var(--text3)">${esc(a.tech||a.server||'')}</td>
+        <td style="font-size:.68rem">${[a.shared_ip?'CDN?':'',a.is_wildcard?'WILDCARD':'',a.is_internal?'INTERNO':''].filter(Boolean).join(' ')||'-'}</td>
+      </tr>`).join('')}</tbody></table>
+
+      <h3 style="font-size:.95rem;margin:16px 0 6px">5. Recomendaciones</h3>
+      <ul style="font-size:.82rem;color:var(--text2);line-height:1.6;padding-left:20px">
+        ${(rep.recommendations||[]).map(r=>`<li>${esc(r)}</li>`).join('')}
+      </ul>
+      <div style="color:var(--text3);font-size:.68rem;margin-top:16px;border-top:1px solid var(--border);padding-top:8px">
+        Generado por Sharingan. Los hallazgos "probables" no fueron re-confirmados activamente y requieren validación manual.
+      </div>
+    </div>`;
+}
+
+function _download(name, content, type) {
+  const blob = new Blob([content], {type});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function exportReportJson() {
+  if (!_reportData) return;
+  const dom = (_reportData.scan && _reportData.scan.domain) || 'scan';
+  _download(`sharingan-${dom}.json`, JSON.stringify(_reportData, null, 2), 'application/json');
+}
+
+function exportReportCsv() {
+  if (!_reportData) return;
+  const fn = _reportData.findings || {};
+  const all = [].concat(fn.verified||[], fn.probable||[], fn.inconclusive||[]);
+  const esc2 = v => `"${String(v==null?'':v).replace(/"/g,'""')}"`;
+  const rows = [['validacion','tipo','host','hallazgo','severidad','ubicacion']];
+  all.forEach(f => rows.push([f.validation_status,f.finding_type,f.canonical_host,f.name,f.severity,f.location].map(esc2)));
+  const dom = (_reportData.scan && _reportData.scan.domain) || 'scan';
+  _download(`sharingan-${dom}-findings.csv`, rows.map(r=>r.join(',')).join('\r\n'), 'text/csv');
 }
 
 // ── Start Scan ──

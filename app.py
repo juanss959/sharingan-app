@@ -3441,6 +3441,87 @@ def get_scan_assets(scan_id):
     return jsonify({"scan_id": scan_id, "assets": out})
 
 
+# Palabras clave → recomendación (para la sección de recomendaciones del reporte).
+_REPORT_RECOS = [
+    (("/.env", ".env", "actuator/env", "actuator/heapdump", ".git/config", ".git/head",
+      "id_rsa", "credentials", ".aws/credentials", "wp-config"),
+     "Remover de inmediato los archivos sensibles expuestos (.env, .git, credenciales, dumps) del webroot y rotar cualquier secreto filtrado."),
+    (("admin", "manager", "panel", "phpmyadmin", "adminer", "cpanel", "webmail", "dashboard"),
+     "Restringir el acceso a paneles administrativos (IP allowlist / VPN / autenticación fuerte) y no exponerlos a Internet."),
+    (("backup", ".bak", ".sql", "dump", ".zip", ".old"),
+     "Eliminar respaldos y volcados accesibles públicamente; no dejar artefactos de backup en hosts web."),
+    (("swagger", "openapi", "api-docs", "redoc", "graphql"),
+     "Revisar documentación de API expuesta en busca de endpoints no documentados y restringirla en producción."),
+]
+
+
+@app.route("/api/scans/<int:scan_id>/report")
+def get_scan_report(scan_id):
+    """Reporte estructurado del scan: resumen, superficie de ataque (assets),
+    hallazgos separados por veredicto, y recomendaciones derivadas. Fuente única
+    para la vista de informe y el export JSON. No toca get_scan."""
+    db = get_db()
+    scan = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+    if not scan:
+        db.close()
+        return jsonify({"error": "not found"}), 404
+    scan = dict(scan)
+
+    def count(sql, *a):
+        return db.execute(sql, a).fetchone()[0]
+
+    stats = {
+        "subdomains": count("SELECT COUNT(*) FROM subdomains WHERE scan_id=?", scan_id),
+        "resolved":   count("SELECT COUNT(*) FROM subdomains WHERE scan_id=? AND resolved=1", scan_id),
+        "wildcard":   count("SELECT COUNT(*) FROM subdomains WHERE scan_id=? AND is_wildcard=1", scan_id),
+        "alive":      count("SELECT COUNT(*) FROM alive_hosts WHERE scan_id=?", scan_id),
+        "ports":      count("SELECT COUNT(*) FROM ports WHERE scan_id=? AND state='open'", scan_id),
+        "vulns":      count("SELECT COUNT(*) FROM vulns WHERE scan_id=?", scan_id),
+        "dirs":       count("SELECT COUNT(*) FROM directories WHERE scan_id=?", scan_id),
+        "assets":     count("SELECT COUNT(*) FROM assets WHERE scan_id=?", scan_id),
+        "urls":       count("SELECT COUNT(*) FROM urls WHERE scan_id=?", scan_id),
+    }
+
+    # Superficie de ataque: assets con puertos (resumen).
+    assets = []
+    for a in db.execute("""SELECT canonical_host, ip, url, title, tech, server, status_code,
+                                  is_wildcard, is_internal, shared_ip
+                           FROM assets WHERE scan_id=? ORDER BY canonical_host""", (scan_id,)).fetchall():
+        a = dict(a)
+        a["ports"] = [dict(r) for r in db.execute(
+            "SELECT port, service, version FROM ports WHERE scan_id=? AND norm_host(host)=? AND state='open' ORDER BY port",
+            (scan_id, a["canonical_host"])).fetchall()]
+        assets.append(a)
+
+    # Hallazgos separados por veredicto (confirmados vs observaciones).
+    findings = {"verified": [], "probable": [], "inconclusive": [], "false_positive": []}
+    for f in db.execute("""SELECT finding_type, canonical_host, name, severity, location,
+                                  validation_status, evidence
+                           FROM findings WHERE scan_id=?
+                           ORDER BY CASE validation_status WHEN 'verified' THEN 0 WHEN 'probable' THEN 1
+                                    WHEN 'inconclusive' THEN 2 ELSE 3 END, canonical_host""", (scan_id,)).fetchall():
+        f = dict(f)
+        findings.setdefault(f.get("validation_status") or "probable", []).append(f)
+
+    # Recomendaciones derivadas de los nombres de hallazgos.
+    corpus = " ".join((f.get("name") or "").lower() + " " + (f.get("location") or "").lower()
+                      for grp in findings.values() for f in grp)
+    recommendations = [txt for kws, txt in _REPORT_RECOS if any(k in corpus for k in kws)]
+    if stats["wildcard"]:
+        recommendations.append(f"Hay {stats['wildcard']} subdominios wildcard/fantasma: validar que no oculten servicios reales antes de descartarlos.")
+    if not recommendations:
+        recommendations.append("No se derivaron recomendaciones automáticas; revisar manualmente los hallazgos marcados como 'probable'.")
+
+    db.close()
+    return jsonify({
+        "scan": scan,
+        "stats": stats,
+        "assets": assets,
+        "findings": findings,
+        "recommendations": recommendations,
+    })
+
+
 @app.route("/api/scans/<int:scan_id>", methods=["DELETE"])
 def delete_scan(scan_id):
     db = get_db()
