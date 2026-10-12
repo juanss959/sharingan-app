@@ -2178,6 +2178,7 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
     emit("fuzz_status", {"status": "running", "msg": "Preparando fuzzing..."})
 
     use_ffuf = "ffuf" in run_argv(["ffuf", "-V"], timeout=8).lower()
+    use_ferox = (not use_ffuf) and ("feroxbuster" in run_argv(["feroxbuster", "-V"], timeout=8).lower())
 
     tmpdir = Path(tempfile.mkdtemp(prefix="sharingan-fuzz-"))
 
@@ -2299,6 +2300,65 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
                         "words": r.get("words", 0), "lines": r.get("lines", 0),
                         "path": path, "redirect": redirect,
                         "type": categorize_path(path, redirect),
+                        "interest": sev, "interest_reason": reason,
+                        "validation_status": vstatus, "validation_reason": vreason,
+                    })
+                results["filtered_count"] = filtered
+            except Exception:
+                pass
+
+    # ───────────────────────── feroxbuster (fallback) ─────────────────────
+    elif use_ferox and wordlist_path:
+        results["method"] = "feroxbuster"
+        emit("fuzz_status", {"status": "running", "msg": "Ejecutando feroxbuster..."})
+        wl = wordlist_path
+        if extra_words:
+            try:
+                combined = tmpdir / "wordlist.txt"
+                orig = Path(wordlist_path).read_text(encoding="utf-8", errors="replace") if Path(wordlist_path).exists() else ""
+                combined.write_text("\n".join(list(dict.fromkeys(extra_words + orig.splitlines()))), encoding="utf-8")
+                wl = str(combined)
+            except Exception:
+                pass
+        output_file = tmpdir / "ferox.json"
+        argv = ["feroxbuster", "-u", url, "-w", wl, "--json", "-o", str(output_file),
+                "-k", "-q", "-t", str(eff_threads)]
+        if max_depth and max_depth > 1:
+            argv += ["-d", str(int(max_depth))]
+        else:
+            argv += ["--no-recursion"]
+        if extensions:
+            argv += ["-x", ",".join(extensions)]
+        for k, v in base_headers.items():
+            if k.lower() == "user-agent":
+                continue
+            argv += ["-H", f"{k}: {v}"]
+        run_argv_cancel(argv, scan_id=scan_id, timeout=540)
+        ff_baseline = get_baseline(url, calib_sess, extensions)
+        if output_file.exists():
+            try:
+                filtered = 0
+                for line in output_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        j = json.loads(line)
+                    except Exception:
+                        continue
+                    if j.get("type") != "response":
+                        continue
+                    hurl = j.get("url", "")
+                    status = j.get("status", 0)
+                    rlen = j.get("content_length", 0)
+                    path = _urlparse(hurl).path.lstrip("/") if hurl else ""
+                    if is_baseline(ff_baseline, path, status, rlen, "", ""):
+                        filtered += 1
+                        continue
+                    sev, reason = classify_interest(path, status, rlen)
+                    vstatus, vreason = classify_discovery(status, has_distinct_body=False)
+                    results["found"].append({
+                        "url": hurl, "status": status, "length": rlen,
+                        "words": j.get("word_count", 0), "lines": j.get("line_count", 0),
+                        "path": path, "redirect": "",
+                        "type": categorize_path(path, ""),
                         "interest": sev, "interest_reason": reason,
                         "validation_status": vstatus, "validation_reason": vreason,
                     })
@@ -3288,9 +3348,25 @@ def run_scan(scan_id, domain, phases):
 
             wb_out, _ = run_argv_cancel(["waybackurls", domain], scan_id=scan_id, timeout=300)
             gau_out, _ = run_argv_cancel(["gau", domain], scan_id=scan_id, timeout=300)
+            # katana: crawl ACTIVO (descubre endpoints que no están en archivos
+            # históricos); solo contra el objetivo autorizado y gateado por SSRF.
+            kat_out = ""
+            ok, _m = _assert_public_target("https://" + domain)
+            if ok:
+                kat_out, _ = run_argv_cancel(["katana", "-u", f"https://{domain}", "-silent",
+                                              "-d", "2", "-nc", "-jc"], scan_id=scan_id, timeout=300)
 
             all_urls = set()
-            for line in (wb_out + "\n" + gau_out).splitlines():
+            wb_set, kat_set = set(), set()
+            for line in wb_out.splitlines():
+                u = line.strip()
+                if u.startswith("http"):
+                    wb_set.add(u)
+            for line in kat_out.splitlines():
+                u = line.strip()
+                if u.startswith("http"):
+                    kat_set.add(u)
+            for line in (wb_out + "\n" + gau_out + "\n" + kat_out).splitlines():
                 u = line.strip()
                 if u and u.startswith("http"):
                     all_urls.add(u)
@@ -3308,7 +3384,7 @@ def run_scan(scan_id, domain, phases):
                             cat = "file"
                             break
 
-                source = "waybackurls" if url in wb_out else "gau"
+                source = "waybackurls" if url in wb_set else ("katana" if url in kat_set else "gau")
                 db.execute("INSERT INTO urls (scan_id, url, source, category) VALUES (?, ?, ?, ?)",
                            (scan_id, url, source, cat))
             db.commit()
@@ -3352,11 +3428,12 @@ def index():
 
 @app.route("/api/tools")
 def tools_status():
-    tools = ["subfinder", "sublist3r", "assetfinder", "httpx", "nmap", "nuclei", "ffuf", "dirsearch", "waybackurls", "gau", "whois"]
+    tools = ["subfinder", "sublist3r", "assetfinder", "httpx", "nmap", "nuclei", "ffuf", "feroxbuster", "dirsearch", "katana", "waybackurls", "gau", "whois"]
     cmds = {
         "subfinder": ["subfinder", "-version"], "sublist3r": ["python", "-m", "sublist3r", "--help"],
         "assetfinder": ["assetfinder", "-h"], "httpx": ["httpx", "-version"], "nmap": ["nmap", "--version"],
-        "nuclei": ["nuclei", "-version"], "ffuf": ["ffuf", "-V"], "dirsearch": ["python", "-m", "dirsearch", "--help"],
+        "nuclei": ["nuclei", "-version"], "ffuf": ["ffuf", "-V"], "feroxbuster": ["feroxbuster", "-V"],
+        "dirsearch": ["python", "-m", "dirsearch", "--help"], "katana": ["katana", "-version"],
         "waybackurls": ["waybackurls", "-h"], "gau": ["gau", "--help"], "whois": ["whois", "-?"],
     }
     results = {}
