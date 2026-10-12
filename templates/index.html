@@ -961,6 +961,7 @@ function renderVulnsView(vulns) {
       <div class="vuln-host">${esc(v.host)}</div>
       ${v.matched_at ? `<div class="vuln-match">${esc(v.matched_at)}</div>` : ''}
       ${meta ? `<div style="color:var(--text3);font-size:.72rem;margin-top:4px">${esc(meta)}</div>` : ''}
+      <div style="margin-top:6px">${aiBtn({tipo:'vuln', template:v.template, severity:v.severity, host:v.host, info:v.info, matched_at:v.matched_at, cve:ev.cve, cvss:ev.cvss_score})}</div>
     </div>`;}).join('')}</div>`;
 }
 
@@ -1950,6 +1951,34 @@ function formatDate(s) {
     const d = new Date(s);
     return d.toLocaleDateString('es') + ' ' + d.toLocaleTimeString('es', {hour:'2-digit',minute:'2-digit'});
   } catch(e) { return s; }
+}
+
+// ── Copiloto IA: explicar hallazgo (read-only, guardrails en backend) ──
+let _aiSeq = 0;
+async function explainFinding(finding, boxId) {
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  box.style.display = '';
+  box.innerHTML = '<span style="color:var(--text3);font-size:.76rem">🤖 Consultando a la IA...</span>';
+  try {
+    const res = await fetch('/api/ai/explain', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ finding })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      box.innerHTML = `<div style="font-size:.78rem;color:var(--text);white-space:pre-wrap;line-height:1.5">🤖 ${esc(data.explanation)}</div>`;
+    } else {
+      box.innerHTML = `<div style="font-size:.76rem;color:var(--orange)">${esc(data.error || 'Error')}</div>`;
+    }
+  } catch (e) {
+    box.innerHTML = '<div style="font-size:.76rem;color:var(--orange)">Error consultando la IA.</div>';
+  }
+}
+function aiBtn(finding) {
+  const id = 'ai-box-' + (_aiSeq++);
+  const payload = esc(JSON.stringify(finding));
+  return `<button onclick='explainFinding(JSON.parse(this.dataset.f), "${id}")' data-f="${payload}" style="background:var(--bg3,var(--bg2));border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:.68rem;padding:2px 8px;cursor:pointer">🤖 Explicar</button><div id="${id}" style="display:none;margin-top:6px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px"></div>`;
 }
 
 document.addEventListener('DOMContentLoaded', () => { try { initPhasePanel(); } catch(e) {} });
