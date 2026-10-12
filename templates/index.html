@@ -192,9 +192,17 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <h1><span>S</span>haringan</h1>
     </div>
 
+    <div class="sidebar-input" style="padding-bottom:0">
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="project-select" onchange="selectProject(this.value)" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:.8rem;outline:none"><option value="">— Sin proyecto —</option></select>
+        <button onclick="openProjectForm()" title="Nuevo proyecto" style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--accent);width:34px;height:34px;font-size:1.1rem;cursor:pointer;flex-shrink:0">+</button>
+      </div>
+    </div>
+
     <div class="sidebar-input">
       <input type="text" id="domain-input" placeholder="target.com" onkeydown="if(event.key==='Enter')startScan()">
       <button class="scan-btn" id="start-btn" onclick="startScan()">Iniciar Scan</button>
+      <div id="scope-hint" style="margin-top:7px;font-size:.66rem;color:var(--text3);line-height:1.35"></div>
       <details style="margin-top:8px">
         <summary style="cursor:pointer;color:var(--text3);font-size:.68rem;text-transform:uppercase;letter-spacing:1px">Fases / Plantilla</summary>
         <div style="margin-top:6px">
@@ -273,6 +281,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div class="nav-item" data-mod="user_osint" onclick="showModule('user_osint')">
         <span class="icon">👤</span><span class="label">User OSINT</span>
       </div>
+      <div class="nav-item" data-mod="projects" onclick="showModule('projects')">
+        <span class="icon">🗂</span><span class="label">Proyectos</span>
+      </div>
       <div class="nav-item" data-mod="history" onclick="showModule('history')">
         <span class="icon">📜</span><span class="label">Historial</span>
       </div>
@@ -320,8 +331,27 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div id="view-bypass403" style="display:none"></div>
       <div id="view-osint" style="display:none"></div>
       <div id="view-user_osint" style="display:none"></div>
+      <div id="view-projects" style="display:none"></div>
       <div id="view-history" style="display:none"></div>
       <div id="view-tools" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<div id="project-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px;width:460px;max-width:92vw">
+    <div style="font-weight:700;margin-bottom:12px">🎯 Nuevo proyecto / engagement</div>
+    <input id="pf-name" placeholder="Nombre del engagement" style="width:100%;margin-bottom:8px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:.82rem;outline:none">
+    <input id="pf-client" placeholder="Cliente / programa (opcional)" style="width:100%;margin-bottom:8px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:.82rem;outline:none">
+    <select id="pf-type" style="width:100%;margin-bottom:8px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:.82rem;outline:none">
+      <option value="webpentest">Web Pentest</option>
+      <option value="bugbounty">Bug Bounty</option>
+    </select>
+    <textarea id="pf-roots" placeholder="Alcance autorizado (roots): ejemplo.com, *.ejemplo.com — uno por línea o coma" rows="3" style="width:100%;margin-bottom:8px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:.78rem;font-family:monospace;outline:none;resize:vertical"></textarea>
+    <textarea id="pf-excl" placeholder="Exclusiones (opcional): blog.ejemplo.com, ..." rows="2" style="width:100%;margin-bottom:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:.78rem;font-family:monospace;outline:none;resize:vertical"></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="closeProjectForm()" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 14px;cursor:pointer;font-size:.82rem">Cancelar</button>
+      <button onclick="submitProject()" style="background:linear-gradient(135deg,var(--accent2),var(--accent));border:none;border-radius:8px;color:#fff;padding:8px 16px;font-weight:600;cursor:pointer;font-size:.82rem">Crear</button>
     </div>
   </div>
 </div>
@@ -331,7 +361,112 @@ const socket = io();
 let currentScanId = null;
 let currentScanData = null;
 let activeModule = null;
+let currentProject = null;
+let projectsCache = [];
 const phaseNames = ['','Recon Pasivo','Subdominios','Hosts Vivos','Port Scan','Vulnerabilidades','Directorios','URLs'];
+
+// ── Proyectos / alcance autorizado ──
+async function loadProjects() {
+  try { const r = await fetch('/api/projects'); projectsCache = await r.json(); } catch(e) { projectsCache = []; }
+  const sel = document.getElementById('project-select');
+  if (sel) {
+    sel.innerHTML = '<option value="">— Sin proyecto —</option>' +
+      projectsCache.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+    let saved = ''; try { saved = localStorage.getItem('sharingan.project') || ''; } catch(e) {}
+    if (saved && projectsCache.some(p => String(p.id) === saved)) sel.value = saved;
+    selectProject(sel.value);
+  }
+}
+function selectProject(id) {
+  currentProject = projectsCache.find(p => String(p.id) === String(id)) || null;
+  try { localStorage.setItem('sharingan.project', currentProject ? String(currentProject.id) : ''); } catch(e) {}
+  renderScopeHint();
+  if (activeModule === 'history') loadHistory();
+  if (activeModule === 'projects') renderProjectsModule();
+}
+function projectId() { return currentProject ? currentProject.id : null; }
+function renderScopeHint() {
+  const el = document.getElementById('scope-hint');
+  if (!el) return;
+  if (!currentProject) { el.innerHTML = '<span style="color:var(--text3)">Sin proyecto — scans ad-hoc</span>'; return; }
+  const roots = parseScopeList(currentProject.scope_roots);
+  el.innerHTML = `<b style="color:var(--accent)">${esc(currentProject.name)}</b> · alcance: ${roots.length ? esc(roots.join(', ')) : '<span style="color:var(--orange)">(sin roots → todo bloqueado)</span>'}`;
+}
+// Pre-check cliente (UX; el gate del servidor es el autoritativo)
+function inScope(name, root) {
+  name = (name||'').trim().toLowerCase().replace(/\.+$/,'');
+  root = (root||'').trim().toLowerCase().replace(/\.+$/,'');
+  return !!name && (name === root || name.endsWith('.' + root));
+}
+function hostOf(input) {
+  let s = (input||'').trim();
+  try { if (!/:\/\//.test(s)) s = 'https://' + s; return new URL(s).hostname.toLowerCase().replace(/\.+$/,''); }
+  catch(e) { return s.toLowerCase().replace(/^https?:\/\//,'').split('/')[0].split(':')[0].replace(/\.+$/,''); }
+}
+function parseScopeList(s) {
+  return (s||'').split(/[\s,;]+/).map(x => x.trim().replace(/^\*\./,'').toLowerCase().replace(/^https?:\/\//,'').split('/')[0].split(':')[0].replace(/\.+$/,'')).filter(Boolean);
+}
+function scopePreCheck(target) {
+  if (typeof currentProject === 'undefined' || !currentProject) return { ok: true };
+  const host = hostOf(target);
+  const roots = parseScopeList(currentProject.scope_roots);
+  const excl = parseScopeList(currentProject.exclusions);
+  if (excl.some(x => inScope(host, x))) return { ok: false, msg: `${host} está EXCLUIDO del alcance de "${currentProject.name}".` };
+  if (!roots.length) return { ok: false, msg: `El proyecto "${currentProject.name}" no tiene roots de alcance definidos.` };
+  if (!roots.some(r => inScope(host, r))) return { ok: false, msg: `${host} está FUERA del alcance de "${currentProject.name}".` };
+  return { ok: true };
+}
+function openProjectForm() { const m = document.getElementById('project-modal'); if (m) m.style.display = 'flex'; }
+function closeProjectForm() { const m = document.getElementById('project-modal'); if (m) m.style.display = 'none'; }
+async function submitProject() {
+  const body = {
+    name: document.getElementById('pf-name').value.trim(),
+    type: document.getElementById('pf-type').value,
+    scope_roots: document.getElementById('pf-roots').value.trim(),
+    exclusions: document.getElementById('pf-excl').value.trim(),
+    client: document.getElementById('pf-client').value.trim(),
+  };
+  if (!body.name) { alert('El nombre es requerido'); return; }
+  try {
+    const res = await fetch('/api/projects', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const p = await res.json().catch(() => ({}));
+    if (!res.ok) { alert(p.error || 'No se pudo crear el proyecto'); return; }
+    closeProjectForm();
+    ['pf-name','pf-roots','pf-excl','pf-client'].forEach(id => document.getElementById(id).value = '');
+    await loadProjects();
+    const sel = document.getElementById('project-select'); if (sel) { sel.value = String(p.id); selectProject(p.id); }
+  } catch(e) { alert('Error creando el proyecto'); }
+}
+async function deleteProject(id) {
+  if (!confirm('Eliminar este proyecto? Los scans se conservan (quedan sin proyecto).')) return;
+  await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+  if (currentProject && currentProject.id === id) currentProject = null;
+  await loadProjects();
+  if (activeModule === 'projects') renderProjectsModule();
+}
+function renderProjectsModule() {
+  const el = document.getElementById('view-projects');
+  if (!el) return;
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div style="font-weight:700">Proyectos / alcance autorizado</div><button onclick="openProjectForm()" style="background:linear-gradient(135deg,var(--accent2),var(--accent));border:none;border-radius:8px;color:#fff;padding:8px 14px;font-weight:600;cursor:pointer;font-size:.82rem">+ Nuevo</button></div>`;
+  if (!projectsCache.length) { el.innerHTML = html + '<div class="empty-state"><h3>Sin proyectos</h3><p>Creá un engagement para fijar el alcance autorizado de los scans activos.</p></div>'; return; }
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Proyecto</th><th>Tipo</th><th>Alcance</th><th>Scans</th><th>Estado</th><th></th></tr></thead><tbody>';
+  html += projectsCache.map(p => {
+    const active = currentProject && currentProject.id === p.id;
+    const roots = parseScopeList(p.scope_roots);
+    return `<tr style="${active?'background:rgba(0,200,83,.06)':''}">
+      <td><b>${esc(p.name)}</b>${p.client?` <span style="color:var(--text3);font-size:.72rem">(${esc(p.client)})</span>`:''}</td>
+      <td style="font-size:.74rem">${esc(p.type)}</td>
+      <td style="font-size:.72rem;font-family:monospace;color:var(--accent)">${roots.length?esc(roots.join(', ')):'<span style="color:var(--orange)">(sin roots)</span>'}</td>
+      <td style="font-size:.78rem">${p.scan_count||0}</td>
+      <td style="font-size:.72rem">${esc(p.status||'active')}</td>
+      <td style="white-space:nowrap">
+        <button onclick="document.getElementById('project-select').value='${p.id}';selectProject('${p.id}')" style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:.7rem;padding:3px 8px;cursor:pointer">${active?'✓ Activo':'Seleccionar'}</button>
+        <button onclick="deleteProject(${p.id})" style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;color:var(--red);font-size:.7rem;padding:3px 8px;cursor:pointer">Borrar</button>
+      </td></tr>`;
+  }).join('');
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
 
 function hideAllViews() {
   document.querySelectorAll('#content-body > div').forEach(d => d.style.display = 'none');
@@ -363,6 +498,12 @@ function showModule(mod) {
   hideAllViews();
   setActiveNav(mod);
 
+  if (mod === 'projects') {
+    document.getElementById('view-projects').style.display = '';
+    setHeader('🗂 Proyectos', '');
+    renderProjectsModule();
+    return;
+  }
   if (mod === 'history') {
     document.getElementById('view-history').style.display = '';
     setHeader('Historial de Scans', '');
@@ -656,9 +797,11 @@ function selectedPhases() {
 function startScan() {
   const domain = document.getElementById('domain-input').value.trim();
   if (!domain) return;
+  const sc = scopePreCheck(domain);
+  if (!sc.ok) { alert('Fuera de alcance: ' + sc.msg); return; }
   initPhasePanel();
   document.getElementById('start-btn').disabled = true;
-  socket.emit('start_scan', { domain, phases: selectedPhases() });
+  socket.emit('start_scan', { domain, phases: selectedPhases(), project_id: projectId() });
 }
 
 socket.on('scan_started', data => {
@@ -1481,7 +1624,8 @@ function startFuzzing() {
   document.getElementById('fuzz-status').textContent = 'Iniciando fuzzing...';
 
   fuzzHits = [];
-  socket.emit('start_fuzzing', { url, extensions: exts, threads, max_depth, wordlist, headers: lastFuzzHeaders });
+  const _sc=scopePreCheck(url); if(!_sc.ok){ alert('Fuera de alcance: '+_sc.msg); return; }
+  socket.emit('start_fuzzing', { url, extensions: exts, threads, max_depth, wordlist, headers: lastFuzzHeaders, project_id: projectId() });
 }
 
 let lastFuzzHeaders = '';
@@ -1685,7 +1829,7 @@ function verifyWithHttpx() {
   if (btn) { btn.disabled = true; btn.textContent = 'Verificando...'; }
   const el = document.getElementById('httpx-results');
   if (el) el.innerHTML = '<div style="color:var(--accent);font-size:.8rem;padding:8px">Enviando a httpx...</div>';
-  socket.emit('start_httpx_verify', { urls, headers: lastFuzzHeaders });
+  socket.emit('start_httpx_verify', { urls, headers: lastFuzzHeaders, project_id: projectId() });
 }
 
 socket.on('httpx_status', data => {
@@ -1773,7 +1917,8 @@ function startBypass() {
   document.getElementById('bypass-status').style.display = '';
   document.getElementById('bypass-status').textContent = 'Iniciando bypass...';
   bypassHits = [];
-  socket.emit('start_bypass', { url });
+  const _sc=scopePreCheck(url); if(!_sc.ok){ alert('Fuera de alcance: '+_sc.msg); return; }
+  socket.emit('start_bypass', { url, project_id: projectId() });
 }
 
 let bypassHits = [];
@@ -1897,11 +2042,13 @@ function filterBypass() {
 
 // ── History ──
 async function loadHistory() {
-  const res = await fetch('/api/scans');
+  const q = currentProject ? ('?project_id=' + currentProject.id) : '';
+  const res = await fetch('/api/scans' + q);
   const scans = await res.json();
   const el = document.getElementById('view-history');
   if (!scans.length) {
-    el.innerHTML = '<div class="empty-state"><h3>Sin scans todavia</h3><p>Inicia un reconocimiento para ver resultados.</p></div>';
+    const who = currentProject ? `del proyecto "${esc(currentProject.name)}"` : '';
+    el.innerHTML = `<div class="empty-state"><h3>Sin scans ${who}</h3><p>Inicia un reconocimiento para ver resultados.</p></div>`;
     return;
   }
   el.innerHTML = '<div class="scan-list">' + scans.map(s => `
@@ -1981,7 +2128,7 @@ function aiBtn(finding) {
   return `<button onclick='explainFinding(JSON.parse(this.dataset.f), "${id}")' data-f="${payload}" style="background:var(--bg3,var(--bg2));border:1px solid var(--border);border-radius:6px;color:var(--accent);font-size:.68rem;padding:2px 8px;cursor:pointer">🤖 Explicar</button><div id="${id}" style="display:none;margin-top:6px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px"></div>`;
 }
 
-document.addEventListener('DOMContentLoaded', () => { try { initPhasePanel(); } catch(e) {} });
+document.addEventListener('DOMContentLoaded', () => { try { initPhasePanel(); } catch(e) {} try { loadProjects(); } catch(e) {} });
 </script>
 </body>
 </html>

@@ -175,6 +175,20 @@ def init_db():
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_scan_host ON assets(scan_id, canonical_host);
         CREATE INDEX IF NOT EXISTS idx_assets_scan ON assets(scan_id);
+        CREATE TABLE IF NOT EXISTS projects (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            client      TEXT,
+            description TEXT,
+            type        TEXT DEFAULT 'webpentest',
+            scope_roots TEXT,
+            exclusions  TEXT,
+            start_date  TEXT,
+            end_date    TEXT,
+            status      TEXT DEFAULT 'active',
+            created_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
     """)
 
     # ── Migración idempotente para BDs ya existentes ──
@@ -194,7 +208,7 @@ def init_db():
         ("validation_status", "TEXT"), ("evidence", "TEXT"),
     ])
     _ensure_cols("vulns", [("validation_status", "TEXT"), ("evidence", "TEXT")])
-    _ensure_cols("scans", [("mode", "TEXT")])
+    _ensure_cols("scans", [("mode", "TEXT"), ("project_id", "INTEGER")])
     # #7: resolución DNS + wildcard + scope por IP en subdominios.
     _ensure_cols("subdomains", [
         ("ip", "TEXT"), ("resolved", "INTEGER"),
@@ -216,6 +230,8 @@ def init_db():
     """)
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_vulns_unique
                   ON vulns(scan_id, template, host, matched_at)""")
+    # P2: índice de project_id en scans (la columna ya existe por _ensure_cols).
+    db.execute("CREATE INDEX IF NOT EXISTS idx_scans_project ON scans(project_id)")
 
     # ── P2: capa de correlación assets ↔ findings ──
     # findings es una VISTA (no tabla): UNION ALL de vulns + directories con el
@@ -1877,6 +1893,56 @@ def detect_wildcard_dns(domain):
     return wildcard_ips if hits >= 2 else set()
 
 
+# ── Gate de ALCANCE AUTORIZADO (Principio 5) ────────────────────────────────
+# DISTINTO del gate SSRF: responde "¿este objetivo está dentro del alcance
+# autorizado de este engagement?". Se aplica DESPUÉS del SSRF, nunca lo reemplaza.
+def _parse_scope_list(raw):
+    """scope_roots/exclusions crudos (coma/newline/';'/espacio) → hosts canónicos.
+    '*.example.com' se pela a 'example.com'."""
+    if not raw:
+        return []
+    out = []
+    for p in re.split(r"[\s,;]+", str(raw)):
+        p = p.strip()
+        if p.startswith("*."):
+            p = p[2:]
+        h = _norm_host(p)
+        if h:
+            out.append(h)
+    return out
+
+
+def _assert_in_scope(db, target, project_id):
+    """(ok, msg). Sin project_id → ad-hoc, permitido salvo SHARINGAN_REQUIRE_PROJECT=1.
+    Fail-closed: un proyecto sin scope_roots rechaza todo."""
+    if project_id in (None, "", 0, "0"):
+        if os.environ.get("SHARINGAN_REQUIRE_PROJECT", "") == "1":
+            return False, "este servidor exige seleccionar un proyecto autorizado"
+        return True, ""
+    try:
+        pid = int(project_id)
+    except (TypeError, ValueError):
+        return False, "project_id inválido"
+    proj = db.execute("SELECT scope_roots, exclusions, status FROM projects WHERE id=?", (pid,)).fetchone()
+    if not proj:
+        return False, f"el proyecto {pid} no existe"
+    if (proj["status"] or "active") != "active":
+        return False, f"el proyecto no está activo (status={proj['status']})"
+    host = _norm_host(target)
+    if not host:
+        return False, "objetivo sin host válido"
+    for e in _parse_scope_list(proj["exclusions"]):
+        if _in_scope(host, e):
+            return False, f"{host} está excluido del alcance del proyecto (regla: {e})"
+    roots = _parse_scope_list(proj["scope_roots"])
+    if not roots:
+        return False, "el proyecto no tiene alcance autorizado definido"
+    for r in roots:
+        if _in_scope(host, r):
+            return True, ""
+    return False, f"{host} está fuera del alcance autorizado del proyecto"
+
+
 # ── SSRF gate ──────────────────────────────────────────────────────────────
 # Evita que el tool se use como proxy SSRF (p.ej. 169.254.169.254, localhost,
 # redes internas). Por defecto bloquea destinos privados; para apuntar a un dev
@@ -2762,6 +2828,10 @@ def handle_bypass(data):
     if not ok:
         socketio.emit("bypass_status", {"status": "done", "msg": f"Objetivo bloqueado: {msg}"})
         return
+    _gdb = get_db(); ok2, msg2 = _assert_in_scope(_gdb, url, data.get("project_id")); _gdb.close()
+    if not ok2:
+        socketio.emit("bypass_status", {"status": "done", "msg": f"Fuera de alcance: {msg2}"})
+        return
     headers = _parse_headers(data)
     threading.Thread(target=run_403_bypass, args=(url,), kwargs={"headers": headers, "sid": request.sid}, daemon=True).start()
 
@@ -2777,6 +2847,13 @@ def handle_fuzzing(data):
     if not ok:
         socketio.emit("fuzz_status", {"status": "done", "msg": f"Objetivo bloqueado: {msg}"})
         return
+    # P2: gate de alcance autorizado.
+    project_id = data.get("project_id")
+    _gdb = get_db(); ok2, msg2 = _assert_in_scope(_gdb, url, project_id); _gdb.close()
+    if not ok2:
+        socketio.emit("fuzz_status", {"status": "done", "msg": f"Fuera de alcance: {msg2}"})
+        return
+    _pid = int(project_id) if project_id not in (None, "", 0, "0") else None
     # Extensiones: allowlist estricta (evita inyección aunque un cliente no-UI mande basura).
     extensions = [e for e in data.get("extensions", [])
                   if isinstance(e, str) and re.fullmatch(r"[A-Za-z0-9]{1,8}", e)]
@@ -2798,8 +2875,8 @@ def handle_fuzzing(data):
     try:
         sdb = get_db()
         cur = sdb.execute(
-            "INSERT INTO scans (domain, status, mode, started_at) VALUES (?,?,?,?)",
-            (url, "running", "fuzz", datetime.now().isoformat()))
+            "INSERT INTO scans (domain, status, mode, project_id, started_at) VALUES (?,?,?,?,?)",
+            (url, "running", "fuzz", _pid, datetime.now().isoformat()))
         scan_id = cur.lastrowid
         sdb.commit()
         sdb.close()
@@ -2996,13 +3073,17 @@ def run_httpx_verify(urls, headers=None, sid=None):
 @socketio.on("start_httpx_verify")
 def handle_httpx_verify(data):
     urls = data.get("urls", [])
-    # Gate SSRF por URL (misma defensa que fuzzing/bypass).
+    # Gate SSRF + alcance autorizado por URL (misma defensa que fuzzing/bypass).
+    project_id = data.get("project_id")
+    _gdb = get_db()
     clean = []
     for u in urls:
         if u and u.startswith("http"):
             ok, _ = _assert_public_target(u)
-            if ok:
+            ok2, _ = _assert_in_scope(_gdb, u, project_id)
+            if ok and ok2:
                 clean.append(u)
+    _gdb.close()
     urls = clean[:3000]
     if not urls:
         socketio.emit("httpx_status", {"status": "done", "msg": "No hay URLs válidas para verificar (todas bloqueadas por el filtro SSRF)"})
@@ -3446,7 +3527,17 @@ def tools_status():
 @app.route("/api/scans")
 def list_scans():
     db = get_db()
-    scans = db.execute("SELECT * FROM scans ORDER BY id DESC").fetchall()
+    # Filtro opcional ?project_id=<n>|none (compatible hacia atrás: ausente = todos).
+    pf = request.args.get("project_id")
+    if pf == "none":
+        scans = db.execute("SELECT * FROM scans WHERE project_id IS NULL ORDER BY id DESC").fetchall()
+    elif pf not in (None, "", "all"):
+        try:
+            scans = db.execute("SELECT * FROM scans WHERE project_id=? ORDER BY id DESC", (int(pf),)).fetchall()
+        except (TypeError, ValueError):
+            scans = db.execute("SELECT * FROM scans ORDER BY id DESC").fetchall()
+    else:
+        scans = db.execute("SELECT * FROM scans ORDER BY id DESC").fetchall()
     result = []
     for s in scans:
         row = dict(s)
@@ -3662,6 +3753,86 @@ def delete_scan(scan_id):
     return jsonify({"ok": True})
 
 
+# ── P2: CRUD de proyectos / engagements ──
+@app.route("/api/projects", methods=["GET"])
+def list_projects():
+    db = get_db()
+    out = []
+    for p in db.execute("SELECT * FROM projects ORDER BY id DESC").fetchall():
+        p = dict(p)
+        p["scan_count"] = db.execute("SELECT COUNT(*) FROM scans WHERE project_id=?", (p["id"],)).fetchone()[0]
+        out.append(p)
+    db.close()
+    return jsonify(out)
+
+
+@app.route("/api/projects", methods=["POST"])
+def create_project():
+    d = request.get_json(silent=True) or {}
+    name = (d.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name requerido"}), 400
+    ptype = d.get("type") if d.get("type") in ("webpentest", "bugbounty") else "webpentest"
+    db = get_db()
+    cur = db.execute("""INSERT INTO projects
+        (name, client, description, type, scope_roots, exclusions, start_date, end_date, status, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (name, (d.get("client") or "").strip(), (d.get("description") or "").strip(), ptype,
+         (d.get("scope_roots") or "").strip(), (d.get("exclusions") or "").strip(),
+         (d.get("start_date") or "").strip() or None, (d.get("end_date") or "").strip() or None,
+         d.get("status") if d.get("status") in ("active", "paused", "closed") else "active",
+         datetime.now().isoformat()))
+    pid = cur.lastrowid
+    db.commit()
+    row = dict(db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone())
+    db.close()
+    return jsonify(row), 201
+
+
+@app.route("/api/projects/<int:pid>", methods=["GET"])
+def get_project(pid):
+    db = get_db()
+    p = db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+    db.close()
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(dict(p))
+
+
+@app.route("/api/projects/<int:pid>", methods=["PATCH"])
+def update_project(pid):
+    d = request.get_json(silent=True) or {}
+    allowed = ("name", "client", "description", "type", "scope_roots", "exclusions", "start_date", "end_date", "status")
+    sets, vals = [], []
+    for col in allowed:
+        if col in d:
+            sets.append(f"{col}=?")
+            vals.append((d.get(col) or "").strip() if isinstance(d.get(col), str) else d.get(col))
+    if not sets:
+        return jsonify({"error": "nada para actualizar"}), 400
+    db = get_db()
+    if not db.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone():
+        db.close()
+        return jsonify({"error": "not found"}), 404
+    vals.append(pid)
+    db.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id=?", vals)
+    db.commit()
+    row = dict(db.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone())
+    db.close()
+    return jsonify(row)
+
+
+@app.route("/api/projects/<int:pid>", methods=["DELETE"])
+def delete_project(pid):
+    # Política: reasignar scans a NULL (preservar historial), NO cascada.
+    db = get_db()
+    db.execute("UPDATE scans SET project_id=NULL WHERE project_id=?", (pid,))
+    db.execute("DELETE FROM projects WHERE id=?", (pid,))
+    db.commit()
+    db.close()
+    return jsonify({"ok": True})
+
+
 @socketio.on("start_scan")
 def handle_start(data):
     domain = data.get("domain", "").strip().lower()
@@ -3681,11 +3852,19 @@ def handle_start(data):
     if not ok:
         emit("error", {"message": f"Objetivo bloqueado: {msg}"})
         return
-    phases = data.get("phases", [1, 2, 3, 4, 5, 6, 7])
-
+    # ── P2: gate de ALCANCE AUTORIZADO (después del SSRF) ──
+    project_id = data.get("project_id")
     db = get_db()
-    cur = db.execute("INSERT INTO scans (domain, status, started_at) VALUES (?, 'running', ?)",
-                     (domain, datetime.now().isoformat()))
+    ok2, msg2 = _assert_in_scope(db, domain, project_id)
+    if not ok2:
+        db.close()
+        emit("error", {"message": f"Fuera de alcance: {msg2}"})
+        return
+    phases = data.get("phases", [1, 2, 3, 4, 5, 6, 7])
+    _pid = int(project_id) if project_id not in (None, "", 0, "0") else None
+
+    cur = db.execute("INSERT INTO scans (domain, status, project_id, started_at) VALUES (?, 'running', ?, ?)",
+                     (domain, _pid, datetime.now().isoformat()))
     scan_id = cur.lastrowid
     db.commit()
     db.close()
