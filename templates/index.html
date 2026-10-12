@@ -431,7 +431,11 @@ socket.on('phase_status', data => {
   if (data.scan_id !== currentScanId) return;
   const pill = document.getElementById(`pill-${data.phase}`);
   if (pill) pill.className = 'progress-pill ' + data.status;
-  if (data.status === 'running') addLog(`Fase ${data.phase}: ${phaseNames[data.phase]} iniciada...`, true);
+  if (data.note) {
+    // Nota de progreso/error de herramienta (wildcard, timeout, fallo).
+    const warn = /error|timeout|falló|fallo/i.test(data.note);
+    addLog(`Fase ${data.phase}: ${data.note}`, true, warn);
+  } else if (data.status === 'running') addLog(`Fase ${data.phase}: ${phaseNames[data.phase]} iniciada...`, true);
   else if (data.status === 'done') addLog(`Fase ${data.phase}: ${phaseNames[data.phase]} completada`, true);
 });
 
@@ -464,11 +468,12 @@ function resetScanBtn() {
   btn.disabled = false;
 }
 
-function addLog(msg, isPhase) {
+function addLog(msg, isPhase, warn) {
   const log = document.getElementById('live-log');
   const div = document.createElement('div');
   div.className = 'entry' + (isPhase ? ' phase' : '');
-  div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  if (warn) div.style.color = 'var(--orange)';
+  div.textContent = `[${new Date().toLocaleTimeString()}] ${warn ? '⚠ ' : ''}${msg}`;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
 }
@@ -606,9 +611,24 @@ function renderSubsView(subs) {
     el.innerHTML = '<div class="empty-state"><h3>Sin subdominios</h3><p>No se encontraron subdominios.</p></div>';
     return;
   }
+  const resueltos = subs.filter(s => s.resolved).length;
+  const wildcard = subs.filter(s => s.is_wildcard).length;
   el.innerHTML = `<div class="section-title"><span class="icon">🌍</span>Subdominios</div>
-    <div class="filter-row"><input type="text" placeholder="Filtrar..." oninput="filterSubs(this.value)"><span class="count">${subs.length} encontrados</span></div>
-    <div class="sub-list" id="sub-list">${subs.map(s => `<div class="sub-chip" data-sub="${esc(s.subdomain).toLowerCase()}">${esc(s.subdomain)}<span class="sub-src">${esc(s.source)}</span></div>`).join('')}</div>`;
+    <div style="color:var(--text3);font-size:.74rem;margin-bottom:8px">${subs.length} encontrados · ${resueltos} resuelven · ${wildcard} wildcard/fantasma (excluidos de hosts vivos)</div>
+    <div class="filter-row"><input type="text" placeholder="Filtrar..." oninput="filterSubs(this.value)"></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Subdominio</th><th>IP</th><th>Estado</th><th>Fuente</th></tr></thead>
+    <tbody id="sub-list">${subs.map(s => {
+      let flag = '';
+      if (s.is_wildcard) flag = '<span style="background:#c62828;color:#fff;padding:1px 6px;border-radius:4px;font-size:.64rem">WILDCARD</span>';
+      else if (s.is_internal) flag = '<span style="background:var(--orange);color:#000;padding:1px 6px;border-radius:4px;font-size:.64rem">INTERNO</span>';
+      else if (s.resolved) flag = '<span style="background:var(--green);color:#000;padding:1px 6px;border-radius:4px;font-size:.64rem">RESUELVE</span>';
+      else flag = '<span style="color:var(--text3);font-size:.68rem">NXDOMAIN</span>';
+      return `<tr class="sub-chip" data-sub="${esc(s.subdomain).toLowerCase()}" style="${s.is_wildcard?'opacity:.55':''}">
+        <td style="font-family:monospace;font-size:.8rem;color:var(--accent)">${esc(s.subdomain)}</td>
+        <td style="font-size:.76rem;color:var(--text2)">${esc(s.ip||'-')}</td>
+        <td>${flag}</td>
+        <td style="font-size:.74rem;color:var(--text3)">${esc(s.source)}</td>
+      </tr>`;}).join('')}</tbody></table></div>`;
 }
 
 function filterSubs(q) {
@@ -663,12 +683,22 @@ function renderVulnsView(vulns) {
   const order = {critical:0,high:1,medium:2,low:3,info:4,unknown:5};
   vulns.sort((a,b) => (order[a.severity]||5) - (order[b.severity]||5));
   el.innerHTML = `<div class="section-title"><span class="icon">⚡</span>Vulnerabilidades (${vulns.length})</div>
-    <div class="vuln-cards">${vulns.map(v => `
+    <div class="vuln-cards">${vulns.map(v => {
+      let ev = {}; try { ev = JSON.parse(v.evidence || '{}'); } catch(e) {}
+      const cve = (ev.cve && ev.cve.length) ? ev.cve.join(', ') : '';
+      const cvss = ev.cvss_score ? `CVSS ${ev.cvss_score}` : '';
+      const meta = [cve, cvss, ev.matcher].filter(Boolean).join(' · ');
+      return `
     <div class="vuln-card ${v.severity}">
-      <div class="vuln-header"><span class="sev ${v.severity}">${v.severity}</span><span class="vuln-name">${esc(v.info||v.template)}</span></div>
+      <div class="vuln-header">
+        <span class="sev ${v.severity}">${v.severity}</span>
+        ${validationBadge(v.validation_status, ev.validation_reason)}
+        <span class="vuln-name">${esc(v.info||v.template)}</span>
+      </div>
       <div class="vuln-host">${esc(v.host)}</div>
       ${v.matched_at ? `<div class="vuln-match">${esc(v.matched_at)}</div>` : ''}
-    </div>`).join('')}</div>`;
+      ${meta ? `<div style="color:var(--text3);font-size:.72rem;margin-top:4px">${esc(meta)}</div>` : ''}
+    </div>`;}).join('')}</div>`;
 }
 
 function renderDirsView(dirs) {
@@ -677,14 +707,20 @@ function renderDirsView(dirs) {
     el.innerHTML = '<div class="empty-state"><h3>Sin directorios</h3><p>No se encontraron directorios.</p></div>';
     return;
   }
+  const verified = dirs.filter(d => d.validation_status === 'verified').length;
   el.innerHTML = `<div class="section-title"><span class="icon">📁</span>Directorios (${dirs.length})</div>
+    <div style="color:var(--text3);font-size:.74rem;margin-bottom:8px">${verified} verificados · ${dirs.length - verified} probables/otros</div>
     <div class="table-wrap"><table class="data-table">
-    <thead><tr><th>Host</th><th>Path</th><th>Status</th></tr></thead>
-    <tbody>${dirs.map(d => `<tr>
+    <thead><tr><th>Validación</th><th>Interés</th><th>Host</th><th>Path</th><th>Status</th></tr></thead>
+    <tbody>${dirs.map(d => {
+      let ev = {}; try { ev = JSON.parse(d.evidence || '{}'); } catch(e) {}
+      return `<tr>
+      <td>${validationBadge(d.validation_status, ev.validation_reason)}</td>
+      <td>${interestBadge(d.interest, ev.reason)}</td>
       <td style="font-size:.8rem">${esc(d.host)}</td>
       <td style="color:var(--accent);font-family:monospace;font-size:.8rem">${esc(d.path)}</td>
       <td><span style="color:${d.status_code<400?'var(--green)':'var(--orange)'}">${d.status_code}</span></td>
-    </tr>`).join('')}</tbody></table></div>`;
+    </tr>`;}).join('')}</tbody></table></div>`;
 }
 
 function renderUrlsView(urls) {
@@ -1122,6 +1158,7 @@ function initFuzzingView() {
     <div style="display:flex;gap:8px;margin-bottom:12px">
       <input id="fuzz-url" type="text" placeholder="https://target.com" style="flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:.85rem;outline:none">
       <button id="fuzz-btn" onclick="startFuzzing()" style="background:linear-gradient(135deg,#c62828,var(--red));color:#fff;border:none;border-radius:8px;padding:8px 18px;font-weight:600;cursor:pointer;font-size:.85rem">Fuzzear</button>
+      <button id="fuzz-stop-btn" onclick="stopFuzzing()" style="display:none;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:.85rem">Detener</button>
     </div>
     <div style="margin-bottom:12px">
       <div style="color:var(--text2);font-size:.72rem;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Extensiones</div>
@@ -1137,14 +1174,29 @@ function initFuzzingView() {
         <span style="color:var(--text2);font-size:.72rem;text-transform:uppercase;letter-spacing:1px">Threads</span>
         <input id="fuzz-threads" type="number" value="40" min="1" max="100" style="width:60px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:.82rem;margin-left:6px;outline:none">
       </div>
+      <div>
+        <span style="color:var(--text2);font-size:.72rem;text-transform:uppercase;letter-spacing:1px" title="Recursión en directorios descubiertos">Profundidad</span>
+        <input id="fuzz-depth" type="number" value="1" min="1" max="3" style="width:52px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:.82rem;margin-left:6px;outline:none">
+      </div>
       <div style="flex:1">
         <span style="color:var(--text2);font-size:.72rem;text-transform:uppercase;letter-spacing:1px">Wordlist (opcional)</span>
         <input id="fuzz-wordlist" type="text" placeholder="auto-detectar" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:.78rem;margin-top:3px;outline:none">
       </div>
     </div>
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;color:var(--text2);font-size:.72rem;text-transform:uppercase;letter-spacing:1px">Headers / Cookies (fuzzing autenticado)</summary>
+      <textarea id="fuzz-headers" placeholder="Authorization: Bearer eyJ...&#10;Cookie: session=abc123&#10;X-Api-Key: ..." rows="3" style="width:100%;margin-top:6px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:.78rem;font-family:monospace;outline:none;resize:vertical"></textarea>
+      <div style="color:var(--text3);font-size:.7rem;margin-top:3px">Un header por línea (Name: Value). Se usan en el fuzzing y en la verificación httpx.</div>
+    </details>
     <div id="fuzz-status" style="display:none;margin-bottom:12px;padding:8px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--accent);font-size:.82rem"></div>
     <div id="fuzz-results"></div>
   `;
+}
+
+function stopFuzzing() {
+  socket.emit('stop_fuzzing', {});
+  const sb = document.getElementById('fuzz-stop-btn');
+  if (sb) sb.textContent = 'Deteniendo...';
 }
 
 function startFuzzing() {
@@ -1152,17 +1204,23 @@ function startFuzzing() {
   if (!url) return;
   const exts = [...document.querySelectorAll('.fuzz-ext:checked')].map(c => c.value);
   const threads = parseInt(document.getElementById('fuzz-threads').value) || 40;
+  const max_depth = parseInt(document.getElementById('fuzz-depth').value) || 1;
   const wordlist = document.getElementById('fuzz-wordlist').value.trim();
+  lastFuzzHeaders = document.getElementById('fuzz-headers').value || '';
 
   document.getElementById('fuzz-btn').disabled = true;
   document.getElementById('fuzz-btn').textContent = 'Fuzzeando...';
+  const sb = document.getElementById('fuzz-stop-btn');
+  if (sb) { sb.style.display = ''; sb.textContent = 'Detener'; }
   document.getElementById('fuzz-results').innerHTML = '';
   document.getElementById('fuzz-status').style.display = '';
   document.getElementById('fuzz-status').textContent = 'Iniciando fuzzing...';
 
   fuzzHits = [];
-  socket.emit('start_fuzzing', { url, extensions: exts, threads, wordlist });
+  socket.emit('start_fuzzing', { url, extensions: exts, threads, max_depth, wordlist, headers: lastFuzzHeaders });
 }
+
+let lastFuzzHeaders = '';
 
 let fuzzHits = [];
 
@@ -1172,9 +1230,37 @@ socket.on('fuzz_status', data => {
   if (data.status === 'done') {
     const btn = document.getElementById('fuzz-btn');
     if (btn) { btn.disabled = false; btn.textContent = 'Fuzzear'; }
-    setTimeout(() => { if (st) st.style.display = 'none'; }, 4000);
+    const sb = document.getElementById('fuzz-stop-btn');
+    if (sb) sb.style.display = 'none';
+    setTimeout(() => { if (st) st.style.display = 'none'; }, 6000);
   }
 });
+
+function interestColor(sev) {
+  if (sev === 'critical') return '#c62828';
+  if (sev === 'high') return 'var(--orange)';
+  if (sev === 'medium') return 'var(--yellow)';
+  return 'var(--text3)';
+}
+function interestBadge(sev, reason) {
+  sev = sev || 'info';
+  if (sev === 'info') return '<span style="color:var(--text3);font-size:.68rem">—</span>';
+  const label = { critical: 'CRÍTICO', high: 'ALTO', medium: 'MEDIO' }[sev] || sev;
+  return `<span title="${esc(reason||'')}" style="background:${interestColor(sev)};color:#fff;padding:1px 7px;border-radius:4px;font-size:.66rem;font-weight:700;white-space:nowrap">${label}</span>`;
+}
+
+// ── Motor de validación: chip verificado/probable/FP/no-concluyente ──
+function validationBadge(status, reason) {
+  status = status || 'probable';
+  const map = {
+    verified:       { label: 'VERIFICADO',     bg: 'var(--green)',  fg: '#000' },
+    probable:       { label: 'PROBABLE',       bg: 'var(--yellow)', fg: '#000' },
+    inconclusive:   { label: 'NO CONCLUYENTE', bg: 'var(--text3)',  fg: '#fff' },
+    false_positive: { label: 'FALSO POSITIVO', bg: '#c62828',       fg: '#fff' },
+  };
+  const c = map[status] || map.probable;
+  return `<span title="${esc(reason||'')}" style="background:${c.bg};color:${c.fg};padding:1px 7px;border-radius:4px;font-size:.64rem;font-weight:700;white-space:nowrap">${c.label}</span>`;
+}
 
 socket.on('fuzz_hit', entry => {
   fuzzHits.push(entry);
@@ -1189,10 +1275,12 @@ function renderFuzzHitsLive() {
   const el = document.getElementById('fuzz-results');
   if (!el) return;
   let html = `<div style="color:var(--text2);font-size:.78rem;margin-bottom:8px">${fuzzHits.length} encontrados hasta ahora...</div>`;
-  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Validación</th><th>Interés</th><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th></tr></thead><tbody>';
   fuzzHits.slice(-50).forEach(h => {
     const sc = statusColor(h.status);
     html += `<tr>
+      <td>${validationBadge(h.validation_status, h.validation_reason)}</td>
+      <td>${interestBadge(h.interest, h.interest_reason)}</td>
       <td style="color:var(--accent);font-family:monospace;font-size:.8rem">/${esc(h.path)}</td>
       <td><span style="color:${sc};font-weight:600">${h.status}</span></td>
       <td><span style="background:${typeColor(h.type)};padding:1px 8px;border-radius:4px;font-size:.7rem;color:#fff">${esc(h.type)}</span></td>
@@ -1219,6 +1307,7 @@ function renderFuzzResults(data) {
   const dirs = found.filter(f => f.type === 'directory');
   const files = found.filter(f => f.type === 'file');
   const redirs = found.filter(f => f.type === 'redirect');
+  const highValue = found.filter(f => f.interest === 'critical' || f.interest === 'high');
 
   let html = `<div style="display:flex;gap:10px;margin-bottom:16px">
     <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
@@ -1233,11 +1322,30 @@ function renderFuzzResults(data) {
       <div style="font-size:1.3rem;font-weight:700;color:var(--orange)">${files.length}</div>
       <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Archivos</div>
     </div>
-    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 20px;text-align:center;flex:1">
-      <div style="font-size:1.3rem;font-weight:700;color:var(--purple)">${redirs.length}</div>
-      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Redirects</div>
+    <div style="background:var(--bg2);border:1px solid ${highValue.length ? '#c62828' : 'var(--border)'};border-radius:10px;padding:12px 20px;text-align:center;flex:1">
+      <div style="font-size:1.3rem;font-weight:700;color:#e53935">${highValue.length}</div>
+      <div style="font-size:.68rem;color:var(--text2);text-transform:uppercase">Alto valor</div>
     </div>
   </div>`;
+
+  if (data.waf || data.stack) {
+    html += `<div style="margin-bottom:10px;font-size:.74rem;color:var(--text2)">
+      ${data.waf ? `<span style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:2px 8px;margin-right:6px">WAF: <b style="color:var(--orange)">${esc(data.waf)}</b></span>` : ''}
+      ${data.stack ? `<span style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:2px 8px">Stack: <b style="color:var(--cyan)">${esc(data.stack)}</b></span>` : ''}
+    </div>`;
+  }
+
+  if (highValue.length) {
+    html += `<div style="background:rgba(198,40,40,.08);border:1px solid #c62828;border-radius:10px;padding:10px 14px;margin-bottom:12px">
+      <div style="font-weight:600;font-size:.82rem;color:#e53935;margin-bottom:6px">⚠ ${highValue.length} hallazgo(s) de alto valor</div>
+      ${highValue.slice(0, 15).map(f => `<div style="font-size:.76rem;margin:2px 0">
+        ${interestBadge(f.interest, f.interest_reason)}
+        <a href="${esc(f.url)}" target="_blank" style="color:var(--accent);font-family:monospace;text-decoration:none;margin-left:6px">/${esc(f.path)}</a>
+        <span style="color:${statusColor(f.status)};margin-left:6px">${f.status}</span>
+        <span style="color:var(--text3);margin-left:6px">${esc(f.interest_reason||'')}</span>
+      </div>`).join('')}
+    </div>`;
+  }
 
   const statusCounts = {};
   found.forEach(f => { statusCounts[f.status] = (statusCounts[f.status] || 0) + 1; });
@@ -1253,19 +1361,22 @@ function renderFuzzResults(data) {
       <option value="no403">Ocultar 403</option>
       <option value="no404">Ocultar 404</option>
       <option value="interesting">Interesantes (200, 301, 302, 500+)</option>
+      <option value="highvalue">Solo alto valor</option>
       ${statusKeys.map(s => `<option value="${s}">Solo ${s} (${statusCounts[s]})</option>`).join('')}
     </select>
     <button onclick="verifyWithHttpx()" id="httpx-verify-btn" style="background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border:none;border-radius:8px;padding:7px 14px;font-weight:600;cursor:pointer;font-size:.8rem;white-space:nowrap">Verificar con httpx</button>
     <span style="color:var(--text3);font-size:.75rem">Metodo: ${esc(data.method || 'auto')}</span>
-    ${data.filtered_count ? `<span style="color:var(--yellow);font-size:.72rem">${data.filtered_count} descartados (catch-all ${data.catch_all_size || ''}B)</span>` : ''}
+    ${data.filtered_count ? `<span style="color:var(--yellow);font-size:.72rem">${data.filtered_count} descartados (catch-all)</span>` : ''}
   </div>`;
 
   html += '<div id="httpx-results" style="margin-bottom:12px"></div>';
   html += '<div id="fuzz-visible-count" style="color:var(--text3);font-size:.72rem;margin-bottom:6px"></div>';
-  html += '<div class="table-wrap"><table class="data-table" id="fuzz-table"><thead><tr><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th><th>Redirect</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table" id="fuzz-table"><thead><tr><th>Validación</th><th>Interés</th><th>Path</th><th>Status</th><th>Tipo</th><th>Tam.</th><th>Redirect</th></tr></thead><tbody>';
   found.forEach(f => {
     const sc = statusColor(f.status);
-    html += `<tr class="fuzz-row" data-path="${esc(f.path).toLowerCase()}" data-status="${f.status}">
+    html += `<tr class="fuzz-row" data-path="${esc(f.path).toLowerCase()}" data-status="${f.status}" data-interest="${esc(f.interest||'info')}">
+      <td>${validationBadge(f.validation_status, f.validation_reason)}</td>
+      <td>${interestBadge(f.interest, f.interest_reason)}</td>
       <td><a href="${esc(f.url)}" target="_blank" style="color:var(--accent);font-family:monospace;font-size:.8rem;text-decoration:none">/${esc(f.path)}</a></td>
       <td><span style="color:${sc};font-weight:600">${f.status}</span></td>
       <td><span style="background:${typeColor(f.type)};padding:1px 8px;border-radius:4px;font-size:.7rem;color:#fff">${esc(f.type)}</span></td>
@@ -1284,6 +1395,7 @@ function filterFuzz() {
   document.querySelectorAll('.fuzz-row').forEach(r => {
     const path = r.dataset.path;
     const status = parseInt(r.dataset.status);
+    const interest = r.dataset.interest || 'info';
     let show = path.includes(q);
     if (show && sf !== 'all') {
       if (sf === '2xx') show = status >= 200 && status < 300;
@@ -1292,6 +1404,7 @@ function filterFuzz() {
       else if (sf === 'no403') show = status !== 403;
       else if (sf === 'no404') show = status !== 404;
       else if (sf === 'interesting') show = (status >= 200 && status < 300) || status === 301 || status === 302 || status >= 500;
+      else if (sf === 'highvalue') show = interest === 'critical' || interest === 'high';
       else show = status === parseInt(sf);
     }
     r.style.display = show ? '' : 'none';
@@ -1308,7 +1421,7 @@ function verifyWithHttpx() {
   if (btn) { btn.disabled = true; btn.textContent = 'Verificando...'; }
   const el = document.getElementById('httpx-results');
   if (el) el.innerHTML = '<div style="color:var(--accent);font-size:.8rem;padding:8px">Enviando a httpx...</div>';
-  socket.emit('start_httpx_verify', { urls });
+  socket.emit('start_httpx_verify', { urls, headers: lastFuzzHeaders });
 }
 
 socket.on('httpx_status', data => {
@@ -1333,20 +1446,17 @@ socket.on('httpx_result', data => {
   let html = `<div style="background:var(--bg2);border:1px solid var(--accent);border-radius:10px;padding:12px;margin-bottom:8px">
     <div style="font-weight:600;font-size:.85rem;margin-bottom:8px;color:var(--accent)">Verificado con httpx: ${data.total} URLs, ${data.real} probablemente reales</div>
     <div style="color:var(--text3);font-size:.72rem;margin-bottom:8px">Las marcadas en verde tienen tamaño unico (contenido distinto). Las grises comparten tamaño con muchas = posible catch-all residual.</div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>URL</th><th>Status</th><th>Tam.</th><th>Title</th><th>Server / Tech</th><th>Real?</th></tr></thead><tbody>`;
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Validación</th><th>URL</th><th>Status</th><th>Tam.</th><th>Title</th><th>Server / Tech</th></tr></thead><tbody>`;
   results.forEach(r => {
     const sc = statusColor(r.status);
-    const realBadge = r.likely_real
-      ? '<span style="background:var(--green);color:#000;padding:1px 7px;border-radius:4px;font-size:.68rem;font-weight:700">REAL</span>'
-      : `<span style="color:var(--text3);font-size:.7rem">x${r.dup_count} igual</span>`;
     const servTech = [r.server, r.tech].filter(Boolean).join(' / ');
     html += `<tr style="${r.likely_real ? 'background:rgba(0,200,83,.05)' : 'opacity:.6'}">
+      <td>${validationBadge(r.validation_status, r.validation_reason)}</td>
       <td><a href="${esc(r.url)}" target="_blank" style="color:var(--accent);font-family:monospace;font-size:.76rem;text-decoration:none;word-break:break-all">${esc(r.url)}</a></td>
       <td><span style="color:${sc};font-weight:600">${r.status}</span></td>
       <td style="color:var(--text2);font-size:.76rem">${formatBytes(r.length)}</td>
       <td style="color:var(--text);font-size:.76rem">${esc(r.title || '')}</td>
       <td style="color:var(--text2);font-size:.72rem">${esc(servTech)}</td>
-      <td>${realBadge}</td>
     </tr>`;
   });
   html += '</tbody></table></div></div>';

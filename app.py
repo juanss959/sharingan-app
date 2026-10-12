@@ -15,14 +15,24 @@ from flask import Flask, render_template, request, jsonify, g
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "sharingan-key"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+app.config["SECRET_KEY"] = os.environ.get("SHARINGAN_SECRET", "sharingan-key")
+
+# El listener se ata a 127.0.0.1 por defecto y solo acepta orígenes locales.
+# Antes era 0.0.0.0 + cors="*": cualquiera en la LAN podía disparar los
+# handlers (start_fuzzing/start_bypass) y, por la inyección de comandos que
+# existía, lograr RCE/SSRF remoto sin auth. Para exponerlo a propósito,
+# definir SHARINGAN_BIND=0.0.0.0 y SHARINGAN_ORIGINS con la lista explícita.
+BIND_HOST = os.environ.get("SHARINGAN_BIND", "127.0.0.1")
+_default_origins = ["http://127.0.0.1:5000", "http://localhost:5000"]
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("SHARINGAN_ORIGINS", "").split(",") if o.strip()] or _default_origins
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS, async_mode="threading")
 
 DB_PATH = Path(__file__).parent / "sharingan.db"
 GO_BIN = Path.home() / "go" / "bin"
 SCOOP_SHIMS = Path.home() / "scoop" / "shims"
 
 active_scans = {}
+active_fuzz = {}
 
 
 # ── Database ──
@@ -86,7 +96,18 @@ def init_db():
             host TEXT,
             path TEXT,
             status_code INTEGER,
-            content_length INTEGER
+            content_length INTEGER,
+            words INTEGER,
+            lines INTEGER,
+            type TEXT,
+            redirect TEXT,
+            title TEXT,
+            server TEXT,
+            tech TEXT,
+            content_type TEXT,
+            interest TEXT,
+            source TEXT,
+            likely_real INTEGER
         );
         CREATE TABLE IF NOT EXISTS urls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +131,47 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_urls_scan ON urls(scan_id);
         CREATE INDEX IF NOT EXISTS idx_recon_scan ON recon_info(scan_id);
     """)
+
+    # ── Migración idempotente para BDs ya existentes ──
+    # ALTER TABLE ADD COLUMN es seguro de repetir solo si chequeamos antes.
+    def _ensure_cols(table, cols):
+        have = {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in cols:
+            if name not in have:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    _ensure_cols("directories", [
+        ("words", "INTEGER"), ("lines", "INTEGER"), ("type", "TEXT"),
+        ("redirect", "TEXT"), ("title", "TEXT"), ("server", "TEXT"),
+        ("tech", "TEXT"), ("content_type", "TEXT"), ("interest", "TEXT"),
+        ("source", "TEXT"), ("likely_real", "INTEGER"),
+        # Motor de validación central: veredicto + evidencia (JSON).
+        ("validation_status", "TEXT"), ("evidence", "TEXT"),
+    ])
+    _ensure_cols("vulns", [("validation_status", "TEXT"), ("evidence", "TEXT")])
+    _ensure_cols("scans", [("mode", "TEXT")])
+    # #7: resolución DNS + wildcard + scope por IP en subdominios.
+    _ensure_cols("subdomains", [
+        ("ip", "TEXT"), ("resolved", "INTEGER"),
+        ("is_wildcard", "INTEGER"), ("is_internal", "INTEGER"),
+    ])
+
+    # #8: reconciliar scans que quedaron 'running' (el proceso murió con su
+    # hilo daemon dejando el estado colgado para siempre).
+    db.execute("UPDATE scans SET status='interrupted' WHERE status='running'")
+
+    # #9: dedup de vulns. Primero borramos duplicados exactos ya guardados
+    # (mismo scan_id/template/host/matched_at), luego un índice ÚNICO evita
+    # nuevos duplicados vía INSERT OR IGNORE en FASE 5.
+    db.execute("""
+        DELETE FROM vulns WHERE id NOT IN (
+            SELECT MIN(id) FROM vulns
+            GROUP BY scan_id, template, host, matched_at
+        )
+    """)
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_vulns_unique
+                  ON vulns(scan_id, template, host, matched_at)""")
+
     db.commit()
     db.close()
 
@@ -124,29 +186,117 @@ def get_env():
     return env
 
 
-def run_cmd(cmd):
+def run_argv(argv, timeout=600):
+    """Ejecuta un binario externo SIN shell (shell=False). ÚNICO ejecutor.
+
+    Las entradas controladas por el usuario/objetivo (domain, url, wordlist,
+    host, extensiones) se pasan como elementos discretos de la lista, así que
+    los metacaracteres de cmd.exe (`"`, `&`, `|`, `;`, backticks, `$()`) no
+    pueden romper la línea de comando ni inyectar procesos. Reemplazó por
+    completo a run_cmd(shell=True), eliminado para evitar regresiones de
+    inyección de comandos.
+    """
     try:
         proc = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=600, env=get_env(), encoding="utf-8", errors="replace"
+            list(argv), shell=False, capture_output=True, text=True,
+            timeout=timeout, env=get_env(), encoding="utf-8", errors="replace"
         )
         return proc.stdout + proc.stderr
     except Exception as e:
         return f"Error: {e}"
 
 
-def run_cmd_lines(cmd):
-    return [l.strip() for l in run_cmd(cmd).splitlines() if l.strip()]
+def _kill_proc_tree(proc):
+    """Mata el proceso y sus hijos. En Windows terminate() no mata el árbol,
+    así que usamos taskkill /T."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
-def run_ps(script):
+def run_argv_cancel(argv, scan_id=None, timeout=600):
+    """run_argv interrumpible: sondea active_scans[scan_id] cada segundo y mata
+    el proceso (y su árbol) si el scan fue cancelado o si vence el timeout.
+
+    Devuelve (salida:str, estado) con estado ∈ {ok, cancelled, timeout, error}.
+    La salida va a un archivo temporal (no a un pipe) para que herramientas de
+    salida grande — waybackurls/gau — no bloqueen por buffer lleno.
+    """
+    try:
+        outf = tempfile.TemporaryFile(mode="w+b")
+    except Exception as e:
+        return (f"Error: {e}", "error")
+    try:
+        proc = subprocess.Popen(list(argv), shell=False, stdout=outf,
+                                stderr=subprocess.STDOUT, env=get_env())
+    except FileNotFoundError:
+        outf.close()
+        return (f"Error: binario no encontrado: {argv[0]}", "error")
+    except Exception as e:
+        outf.close()
+        return (f"Error: {e}", "error")
+
+    deadline = time.monotonic() + timeout
+    status = "ok"
+    while True:
+        try:
+            proc.wait(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            if scan_id is not None and active_scans.get(scan_id) == "cancelled":
+                _kill_proc_tree(proc)
+                status = "cancelled"
+                break
+            if time.monotonic() > deadline:
+                _kill_proc_tree(proc)
+                status = "timeout"
+                break
+
+    try:
+        outf.seek(0)
+        data = outf.read().decode("utf-8", errors="replace")
+    except Exception:
+        data = ""
+    finally:
+        try:
+            outf.close()
+        except Exception:
+            pass
+
+    # Distinguir "corrió bien con 0 resultados" de "la herramienta falló".
+    if status == "ok" and proc.returncode not in (0, None) and not data.strip():
+        status = "error"
+    return (data, status)
+
+
+def run_ps(script, args=None):
+    """Ejecuta un script PowerShell desde archivo temporal.
+
+    `args` se pasan como elementos discretos a `-File script.ps1 <args>`
+    (ArgumentList), así que los valores del usuario entran como parámetros
+    vinculados (param(...)) y NO por interpolación de string — sin inyección.
+    """
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False, encoding='utf-8') as f:
             f.write(script)
             ps_path = f.name
+        cmd = ['powershell', '-ExecutionPolicy', 'Bypass', '-File', ps_path]
+        if args:
+            cmd += [str(a) for a in args]
         proc = subprocess.run(
-            ['powershell', '-ExecutionPolicy', 'Bypass', '-File', ps_path],
-            capture_output=True, text=True, timeout=60, env=get_env(),
+            cmd, capture_output=True, text=True, timeout=60, env=get_env(),
             encoding='utf-8', errors='replace'
         )
         os.unlink(ps_path)
@@ -257,8 +407,8 @@ def run_fingerprint(db, scan_id, domain):
                 save_info(db, scan_id, "whois", key, matches[0].strip())
 
     # ── DNS Records (PowerShell via temp file) ──
-    dns_script = f"""$ErrorActionPreference = 'SilentlyContinue'
-$d = '{domain}'
+    dns_script = f"""param([string]$d)
+$ErrorActionPreference = 'SilentlyContinue'
 try {{ $r = Resolve-DnsName $d -Type A -EA Stop; $ips = ($r | Where-Object {{ $_.QueryType -eq 'A' -and $_.Name -eq $d }}).IPAddress; if ($ips) {{ "A=" + ($ips -join ", ") }} }} catch {{}}
 try {{ $r = Resolve-DnsName $d -Type AAAA -EA Stop; $ips = ($r | Where-Object {{ $_.QueryType -eq 'AAAA' -and $_.Name -eq $d }}).IPAddress; if ($ips) {{ "AAAA=" + ($ips -join ", ") }} }} catch {{}}
 try {{ $r = Resolve-DnsName $d -Type MX -EA Stop; "MX=" + (($r | Where-Object {{ $_.NameExchange }}).NameExchange -join ", ") }} catch {{}}
@@ -267,7 +417,7 @@ try {{ $r = Resolve-DnsName $d -Type TXT -EA Stop; "TXT=" + (($r | Where-Object 
 try {{ $r = Resolve-DnsName $d -Type CNAME -EA Stop; "CNAME=" + (($r | Where-Object {{ $_.NameHost }}).NameHost -join ", ") }} catch {{}}
 try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.PrimaryServer }}; if ($s) {{ "SOA=" + $s.PrimaryServer + " (Serial: " + $s.SerialNumber + ")" }} }} catch {{}}
 """
-    dns_out = run_ps(dns_script)
+    dns_out = run_ps(dns_script, args=["-d", domain])
     for line in dns_out.splitlines():
         if "=" in line:
             rtype, val = line.split("=", 1)
@@ -279,7 +429,7 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
     # ── HTTP Headers + Security + Tech ──
     working_scheme = None
     for scheme in ["https", "http"]:
-        headers_out = run_cmd(f'curl -sI -m 10 -L {scheme}://{domain}')
+        headers_out = run_argv(["curl", "-sI", "-m", "10", "-L", f"{scheme}://{domain}"])
         if "HTTP/" not in headers_out:
             continue
         working_scheme = scheme
@@ -357,7 +507,7 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
 
     # ── robots.txt ──
     base = f"{working_scheme or 'http'}://{domain}"
-    robots_out = run_cmd(f'curl -s --max-time 10 {base}/robots.txt')
+    robots_out = run_argv(["curl", "-s", "--max-time", "10", f"{base}/robots.txt"])
     if robots_out and 'user-agent' in robots_out.lower() and '<html' not in robots_out.lower():
         save_info(db, scan_id, "files", "robots.txt", robots_out.strip()[:2000])
         disallowed = re.findall(r'Disallow:\s*(.+)', robots_out, re.IGNORECASE)
@@ -368,13 +518,13 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
             save_info(db, scan_id, "files", "Sitemaps", "\n".join(s.strip() for s in sitemaps))
 
     # ── sitemap.xml ──
-    sitemap_out = run_cmd(f'curl -s --max-time 10 {base}/sitemap.xml')
+    sitemap_out = run_argv(["curl", "-s", "--max-time", "10", f"{base}/sitemap.xml"])
     if sitemap_out and '<?xml' in sitemap_out.lower():
         url_count = len(re.findall(r'<loc>', sitemap_out))
         save_info(db, scan_id, "files", "sitemap.xml", f"{url_count} URLs encontradas")
 
     # ── Tech detection from HTML ──
-    html_out = run_cmd(f'curl -s --max-time 10 -L {base}')
+    html_out = run_argv(["curl", "-s", "--max-time", "10", "-L", base])
     if html_out:
         tech_patterns = {
             "jQuery": r'jquery[.-](\d[\d.]*\d)',
@@ -414,7 +564,7 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
         "/api", "/graphql", "/swagger.json", "/api-docs",
     ]
     for path in sensitive_paths:
-        out = run_cmd(f'curl -s -o /dev/null -w "%{{http_code}}" --max-time 5 {base}{path}')
+        out = run_argv(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", f"{base}{path}"])
         code = out.strip()
         if code and code not in ["000", "404", "403", "0"]:
             save_info(db, scan_id, "paths", path, f"HTTP {code}")
@@ -470,18 +620,54 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
             "Hardcoded Private IP": r'(?<![0-9])(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(?::\d{2,5})(?![0-9])',
             "MapBox Token": r'pk\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+',
         }
+        # ── Filtro anti-falsos-positivos (etiquetas UI / i18n / placeholders) ──
+        FALSE_POSITIVE_VALUES = {
+            "password", "passwd", "pwd", "contraseña", "contrasena", "passwort",
+            "senha", "mot de passe", "your password", "enter password",
+            "new password", "confirm password", "current password", "old password",
+            "yourpassword", "mypassword", "placeholder", "example", "changeme",
+            "null", "undefined", "none", "true", "false", "string", "value",
+            "xxxxxxxx", "********",
+        }
+
+        def looks_like_real_secret(secret_name, captured_value):
+            """Descarta valores que no parecen credenciales reales (labels, i18n)."""
+            if captured_value is None:
+                return True  # regex sin grupo de captura (p.ej. AKIA...) ya es especifico
+            v = captured_value.strip()
+            if not v or v.lower() in FALSE_POSITIVE_VALUES:
+                return False
+            if secret_name in ("Password in Code", "Generic Secret"):
+                classes = sum([
+                    any(c.islower() for c in v), any(c.isupper() for c in v),
+                    any(c.isdigit() for c in v), any(not c.isalnum() for c in v),
+                ])
+                # un secreto real mezcla tipos de caracter o es largo; una palabra
+                # de un solo tipo como "Password"/"Contraseña" se descarta
+                if classes < 2 and len(v) < 16:
+                    return False
+            return True
+
         found_secrets = set()
         js_files_scanned = 0
 
-        for js_url in list(js_urls)[:30]:
+        for js_url in sorted(js_urls)[:30]:
             try:
-                js_content = run_cmd(f'curl -s --max-time 15 -L "{js_url}"')
+                # js_url proviene del HTML del target (no del allowlist de dominio):
+                # gatear SSRF antes de descargar, y ejecutar sin shell.
+                ok, _ = _assert_public_target(js_url)
+                if not ok:
+                    continue
+                js_content = run_argv(["curl", "-s", "--max-time", "15", "-L", js_url])
                 if not js_content or len(js_content) < 20:
                     continue
                 js_files_scanned += 1
 
                 for name, pattern in secret_patterns.items():
                     for match in re.finditer(pattern, js_content):
+                        captured = match.group(1) if match.lastindex else None
+                        if not looks_like_real_secret(name, captured):
+                            continue
                         secret_val = match.group(0)[:120]
                         dedup_key = f"{name}:{secret_val}"
                         if dedup_key not in found_secrets:
@@ -1385,177 +1571,762 @@ def categorize_path(path, redirect):
     return "directory"
 
 
-def run_fuzzing(url, extensions, threads, wordlist_path):
-    socketio.emit("fuzz_status", {"status": "running", "msg": "Preparando fuzzing..."})
-    results = {"found": [], "total_requests": 0, "method": ""}
+# ─────────────────────────────────────────────────────────────────────────────
+#  Inteligencia de fuzzing (SSRF gate, soft-404 baseline, WAF, stack, interés)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    url = url.rstrip('/')
+import hashlib as _hashlib
+import ipaddress as _ipaddress
+from urllib.parse import urlparse as _urlparse
 
-    use_ffuf = False
+INTEREST_RANK = {"critical": 0, "high": 1, "medium": 2, "info": 3}
+
+# Rutas/archivos que, si existen, son hallazgos de alto valor en bug bounty.
+# El objetivo es que un 200 en /.env no se pierda entre cientos de 200 de /assets.
+_HV_CRITICAL = [
+    ".env", ".git/config", ".git/head", ".git/", ".svn/", ".hg/",
+    "actuator/env", "actuator/heapdump", "actuator/beans", "actuator/configprops",
+    ".htpasswd", "id_rsa", ".aws/credentials", "docker-compose.yml",
+    "wp-config.php", "config.php", "configuration.php", "settings.py",
+]
+_HV_HIGH = [
+    ".bak", ".sql", ".old", ".backup", "backup", "dump", "phpinfo",
+    "web.config", ".htaccess", "server-status", "server-info",
+    "actuator", "telescope", "horizon", "_ignition", "elmah.axd", "trace.axd",
+    ".git", ".ds_store", "credentials", "secret", ".pem", ".key",
+]
+_HV_MEDIUM = [
+    "admin", "manager", "panel", "console", "dashboard", "phpmyadmin",
+    "adminer", "swagger", "openapi", "api-docs", "redoc", "graphql",
+    "debug", "install", "setup", "login", "cpanel", "webmail",
+]
+
+
+def classify_interest(path, status, length):
+    """Devuelve (severidad, razón) para priorizar hallazgos jugosos.
+
+    Ojo: esto NO se usa para descartar nada; solo para re-ordenar y marcar.
+    Un /backup público legítimo saldrá como 'high' pero igual se muestra.
+    """
+    p = (path or "").lower().lstrip("/")
+    if status in (401, 403):
+        # Protegido = probablemente vale la pena; marcarlo pero sin inflar severidad.
+        base = "medium"
+    else:
+        base = "info"
+    for kw in _HV_CRITICAL:
+        if kw in p:
+            return "critical", f"recurso sensible expuesto ({kw})"
+    for kw in _HV_HIGH:
+        if kw in p:
+            return "high", f"posible exposición ({kw})"
+    for kw in _HV_MEDIUM:
+        if kw in p:
+            sev = "high" if status and 200 <= status < 300 else "medium"
+            return sev, f"superficie administrativa/documentación ({kw})"
+    if status in (401, 403):
+        return "medium", f"acceso restringido ({status}) — candidato a bypass/auth"
+    if status and 500 <= status < 600:
+        return "medium", f"error del servidor ({status}) — posible fuga de info"
+    return base, ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Motor de validación central — taxonomía verificado/probable/FP/no-concluyente
+# ─────────────────────────────────────────────────────────────────────────────
+# Principio: no confiar ciegamente en la herramienta. Cada hallazgo lleva un
+# veredicto + evidencia, para que el analista entienda POR QUÉ se clasificó así.
+VALIDATION_RANK = {"verified": 0, "probable": 1, "inconclusive": 2, "false_positive": 3}
+
+
+def classify_discovery(status, has_distinct_body, httpx_likely_real=None):
+    """Veredicto para un hallazgo de descubrimiento (dir/archivo) que YA pasó
+    el filtro de catch-all. Señales: status, si tenemos cuerpo distinto del
+    baseline (modo nativo), y el veredicto de httpx (likely_real) si existe.
+    """
+    if httpx_likely_real is True:
+        return "verified", "httpx: contenido único, distinto del catch-all"
+    if httpx_likely_real is False:
+        return "false_positive", "httpx: comparte fingerprint con el catch-all"
+    if status is None or status == 0:
+        return "inconclusive", "sin respuesta / timeout"
+    if 200 <= status < 300:
+        if has_distinct_body:
+            return "verified", "200 con cuerpo distinto del catch-all calibrado"
+        return "probable", "200 (sin cuerpo verificado — confirmar con httpx)"
+    if status in (401, 403):
+        return "probable", f"recurso protegido ({status}), distinto del catch-all"
+    if status in (301, 302, 303, 307, 308):
+        return "probable", "redirect distinto del catch-all"
+    if 500 <= status < 600:
+        return "probable", f"error de servidor ({status})"
+    return "inconclusive", f"status {status}"
+
+
+def classify_vuln(severity, matched_at=None):
+    """nuclei/nikto son reportes de herramienta: 'probable' por defecto (no
+    re-confirmados). info → inconclusive. La verificación activa (re-request)
+    puede elevar a 'verified' en el futuro."""
+    sev = (severity or "").lower()
+    if sev in ("critical", "high", "medium", "low"):
+        return "probable", f"template {sev} reportado por nuclei (sin re-confirmar)"
+    return "inconclusive", "severidad info/desconocida"
+
+
+def validation_badge_rank(v):
+    return VALIDATION_RANK.get(v or "probable", 1)
+
+
+# ── Resolución DNS / wildcard / scope (#7) ──────────────────────────────────
+def _in_scope(name, domain):
+    """Scope anclado por sufijo: 'name' debe SER el dominio o un subdominio real
+    de él. Reemplaza el 'domain in name' (substring) que aceptaba
+    'notexample.com' o 'example.com.evil.net' como in-scope."""
+    name = (name or "").strip().lower().rstrip(".")
+    domain = (domain or "").strip().lower().rstrip(".")
+    return bool(name) and (name == domain or name.endswith("." + domain))
+
+
+def _resolve_host(host):
+    """Devuelve el set de IPs (A/AAAA) del host, o set vacío si NXDOMAIN/error."""
     try:
-        r = subprocess.run('ffuf -V', shell=True, capture_output=True,
-                           text=True, timeout=5, env=get_env())
-        use_ffuf = r.returncode == 0 or len(r.stdout + r.stderr) > 0
+        infos = _socket.getaddrinfo(host, None, proto=_socket.IPPROTO_TCP)
+        return {ai[4][0] for ai in infos}
+    except Exception:
+        return set()
+
+
+def _ips_internal(ips):
+    """True si ALGUNA IP es loopback/privada/link-local/reservada (SSRF)."""
+    for a in ips:
+        try:
+            ip = _ipaddress.ip_address(a)
+        except ValueError:
+            continue
+        if (ip.is_loopback or ip.is_private or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
+def detect_wildcard_dns(domain):
+    """Resuelve 3 etiquetas aleatorias inexistentes bajo el dominio. Si resuelven
+    (misma IP o no), la zona tiene wildcard DNS → devolvemos el set de IPs
+    wildcard para descartar subdominios fantasma. Set vacío = sin wildcard."""
+    import random, string
+    wildcard_ips = set()
+    hits = 0
+    for _ in range(3):
+        label = "".join(random.choices(string.ascii_lowercase + string.digits, k=20))
+        ips = _resolve_host(f"{label}.{domain}")
+        if ips:
+            hits += 1
+            wildcard_ips |= ips
+    # Al menos 2 de 3 etiquetas aleatorias resolvieron → es wildcard.
+    return wildcard_ips if hits >= 2 else set()
+
+
+# ── SSRF gate ──────────────────────────────────────────────────────────────
+# Evita que el tool se use como proxy SSRF (p.ej. 169.254.169.254, localhost,
+# redes internas). Por defecto bloquea destinos privados; para apuntar a un dev
+# local a propósito, definir SHARINGAN_ALLOW_PRIVATE=1 o listar hosts en
+# SHARINGAN_ALLOW (coma-separado).
+def _assert_public_target(url):
+    try:
+        u = _urlparse(url if "://" in url else "https://" + url)
+    except Exception:
+        return False, "URL inválida"
+    if u.scheme not in ("http", "https"):
+        return False, f"esquema no permitido: {u.scheme or '(vacío)'}"
+    host = u.hostname
+    if not host:
+        return False, "sin hostname"
+    # Rechazar metacaracteres de control o espacios en el host.
+    if any(c.isspace() for c in host) or any(c in host for c in '"\'`\\'):
+        return False, "hostname con caracteres inválidos"
+
+    allow_private = os.environ.get("SHARINGAN_ALLOW_PRIVATE", "") == "1"
+    allowlist = {h.strip().lower() for h in os.environ.get("SHARINGAN_ALLOW", "").split(",") if h.strip()}
+    if host.lower() in allowlist or allow_private:
+        return True, ""
+
+    # Resolver TODAS las direcciones (defensa anti DNS-rebinding) y rechazar
+    # si alguna es loopback/privada/link-local/reservada.
+    try:
+        infos = _socket.getaddrinfo(host, u.port or (443 if u.scheme == "https" else 80),
+                                    proto=_socket.IPPROTO_TCP)
+        addrs = {ai[4][0] for ai in infos}
+    except Exception as e:
+        return False, f"no resuelve: {e}"
+    if not addrs:
+        return False, "no resuelve a ninguna IP"
+    for a in addrs:
+        try:
+            ip = _ipaddress.ip_address(a)
+        except ValueError:
+            return False, f"IP inválida: {a}"
+        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return False, (f"{host} resuelve a {a} (interna/reservada). "
+                           f"Usá SHARINGAN_ALLOW_PRIVATE=1 para permitirlo.")
+    return True, ""
+
+
+# ── WAF detection (portado de smart_path_fuzzer_v2) ──────────────────────────
+WAF_HEADERS = {
+    "cloudflare": ["cf-ray", "cf-cache-status"],
+    "akamai":     ["x-akamai-transformed", "akamai-origin-hop"],
+    "sucuri":     ["x-sucuri-id", "x-sucuri-cache"],
+    "incapsula":  ["x-iinfo"],
+    "cloudfront": ["x-amz-cf-pop", "x-amz-cf-id"],
+}
+WAF_BODY_PATTERNS = [
+    "access denied", "blocked by cloudflare", "firewall", "security check",
+    "ddos protection", "ray id:", "incapsula incident", "attention required",
+]
+
+
+def _waf_cfg(name):
+    if name == "cloudflare":
+        return {"waf": "cloudflare", "concurrency": 5, "delay": (0.5, 2.0)}
+    if name == "akamai":
+        return {"waf": "akamai", "concurrency": 3, "delay": (1.0, 3.0)}
+    return {"waf": name, "concurrency": 10, "delay": (0.1, 0.5)}
+
+
+def detect_waf(base_url, session):
+    try:
+        r = session.get(base_url + "/", timeout=8, allow_redirects=False,
+                        headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+        hl = {k.lower(): (v or "").lower() for k, v in r.headers.items()}
+        bl = r.text[:600].lower()
+        for name, hdrs in WAF_HEADERS.items():
+            if any(h in hl for h in hdrs):
+                return _waf_cfg(name)
+        if any(p in bl for p in WAF_BODY_PATTERNS):
+            return _waf_cfg("generic")
     except Exception:
         pass
+    return {"waf": None, "concurrency": 30, "delay": (0, 0)}
 
-    tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-fuzz-{int(time.time())}"
-    tmpdir.mkdir(parents=True, exist_ok=True)
 
-    # ── Calibracion: detectar respuesta catch-all (SPA / soft-404) ──
-    # Sitios como Vercel/Next.js devuelven 200 con la misma pagina para
-    # cualquier ruta inexistente. Pedimos rutas aleatorias para aprender
-    # ese tamaño y luego filtrarlo.
+# ── Stack fingerprint (portado de smart_path_fuzzer_v2) ──────────────────────
+STACK_SIGNATURES = {
+    "spring_boot": {
+        "headers": [],
+        "body_patterns": ['"timestamp"', '"status"', '"error"', '"path"'],
+        "extra_words": [
+            "actuator", "actuator/health", "actuator/env", "actuator/beans",
+            "actuator/metrics", "actuator/info", "actuator/loggers",
+            "actuator/threaddump", "actuator/heapdump", "actuator/mappings",
+            "actuator/configprops", "management/health",
+        ],
+    },
+    "django": {
+        "headers": [("x-frame-options", "sameorigin")],
+        "body_patterns": ["csrf verification failed", "csrfmiddlewaretoken"],
+        "extra_words": ["admin/", "admin/login", "api-auth/", "__debug__/", "static/admin/"],
+    },
+    "laravel": {
+        "headers": [("set-cookie", "laravel_session")],
+        "body_patterns": ["laravel", "illuminate"],
+        "extra_words": ["telescope", "horizon", "nova", "_ignition/health-check",
+                        "api/user", "sanctum/csrf-cookie", ".env"],
+    },
+    "express": {
+        "headers": [("x-powered-by", "express")],
+        "body_patterns": ["cannot get", "cannot post"],
+        "extra_words": ["api/", "api/v1/", "api/v2/"],
+    },
+    "dotnet": {
+        "headers": [("x-powered-by", "asp.net"), ("x-aspnet-version", None)],
+        "body_patterns": ["asp.net", "server error in"],
+        "extra_words": ["elmah.axd", "trace.axd", "webresource.axd",
+                        "app_offline.htm", "web.config", "api/values"],
+    },
+    "fastapi": {
+        "headers": [],
+        "body_patterns": ['"detail":', '"detail": "not found"'],
+        "extra_words": ["docs", "redoc", "openapi.json"],
+    },
+    "flask": {
+        "headers": [("server", "werkzeug")],
+        "body_patterns": ["werkzeug"],
+        "extra_words": ["api/", "console"],
+    },
+}
+
+
+def fingerprint_stack(base_url, session):
+    try:
+        r = session.get(base_url + "/___probe_stack___", timeout=8, allow_redirects=False,
+                        headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+        hl = {k.lower(): (v or "").lower() for k, v in r.headers.items()}
+        bl = r.text[:1000].lower()
+        for name, sig in STACK_SIGNATURES.items():
+            for hdr, val in sig["headers"]:
+                if hdr in hl and (val is None or val in hl[hdr]):
+                    return name, sig["extra_words"]
+            if sum(1 for p in sig["body_patterns"] if p.lower() in bl) >= 2:
+                return name, sig["extra_words"]
+    except Exception:
+        pass
+    return None, []
+
+
+# ── Baseline soft-404 / catch-all ────────────────────────────────────────────
+# Reemplaza el "catch_all_size" único por una firma por (profundidad, extensión)
+# basada en status + length + md5(body[:512]). Resuelve el bug de calib_status
+# (un 404 aleatorio ya no desactiva todo el filtro) y los catch-all dinámicos
+# que reflejan el path (cada respuesta cambia de tamaño pero comparte estructura).
+
+def _body_hash(content):
+    return _hashlib.md5(content[:512]).hexdigest()
+
+
+def _rand_token(n):
     import random, string
-    calib_sizes = []
-    calib_status = None
-    socketio.emit("fuzz_status", {"status": "running", "msg": "Calibrando (detectando catch-all)..."})
-    for _ in range(3):
-        rand_path = ''.join(random.choices(string.ascii_lowercase + string.digits, k=24))
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+
+def _depth_bucket(path):
+    return min(path.strip("/").count("/"), 2)
+
+
+def get_baseline(base_url, session, extensions=None):
+    """Sondea rutas inexistentes en varias profundidades y extensiones.
+
+    Devuelve dict: signos[(depth_bucket, ext)] = lista de firmas
+    {status, length, body_hash, location}. Cada firma representa una respuesta
+    catch-all observada para esa clase de ruta.
+    """
+    extensions = extensions or []
+    signatures = {}
+
+    def probe(path_frag, ext):
         try:
-            cr = requests.get(f"{url}/{rand_path}", timeout=8, allow_redirects=False,
-                              headers={"User-Agent": "Mozilla/5.0"}, verify=False)
-            calib_status = cr.status_code
-            if cr.status_code not in (404, 400):
-                calib_sizes.append(len(cr.content))
+            r = session.get(f"{base_url}/{path_frag}", timeout=8, allow_redirects=False,
+                            headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+            key = (_depth_bucket(path_frag), ext)
+            sig = {
+                "status": r.status_code,
+                "length": len(r.content),
+                "body_hash": _body_hash(r.content),
+                "location": r.headers.get("Location", ""),
+            }
+            signatures.setdefault(key, []).append(sig)
         except Exception:
             pass
 
-    # Si rutas aleatorias devuelven 2xx/3xx con tamaño consistente, es un catch-all
-    catch_all_size = None
-    if calib_sizes and calib_status not in (404, 400):
-        if len(set(calib_sizes)) == 1:
-            catch_all_size = calib_sizes[0]
-        else:
-            catch_all_size = max(set(calib_sizes), key=calib_sizes.count)
+    # Tokens de longitud variable a profundidad 1 y 2 (detecta catch-all que
+    # reflejan el path y cambian de tamaño según su largo).
+    for n in (6, 16, 28):
+        probe(_rand_token(n), "")
+    for n in (10, 20):
+        t = _rand_token(n)
+        probe(f"{t}/{_rand_token(8)}", "")
+    # Un sondeo por extensión solicitada (el soft-404 de /x.php puede diferir).
+    for ext in extensions[:6]:
+        probe(f"{_rand_token(14)}.{ext}", ext)
 
-    if catch_all_size is not None:
-        socketio.emit("fuzz_status", {
-            "status": "running",
-            "msg": f"Catch-all detectado (status {calib_status}, {catch_all_size}B) - se filtrara"
-        })
+    return signatures
 
+
+def is_baseline(signatures, path, status, length, body_hash, location):
+    """True si (status, length/hash) coincide con un catch-all de SU MISMO status.
+
+    La comparación es por status: si las rutas aleatorias de calibración NO
+    devolvieron este status, no hay baseline para él y la respuesta se considera
+    real. De ahí emerge la regla de "no filtrar 401/403" en el caso normal
+    (un sitio sano responde 404 a lo inexistente, nunca 403), PERO en un target
+    que hace 403 a todo (WAF), ese 403 SÍ es el catch-all y se filtra —
+    manteniendo solo los 403 cuyo cuerpo difiere del baseline (recurso real
+    detrás del WAF). body_hash vacío (ffuf, que no da cuerpo) cae al margen de
+    tamaño.
+    """
+    last = path.rsplit("/", 1)[-1]
+    ext = last.rsplit(".", 1)[-1].lower() if "." in last else ""
+    candidates = signatures.get((_depth_bucket(path), ext))
+    if not candidates:
+        candidates = [s for sigs in signatures.values() for s in sigs]
+    same_status = [s for s in candidates if s["status"] == status]
+    if not same_status:
+        return False
+    for sig in same_status:
+        if status in (301, 302, 303, 307, 308):
+            if location and sig["location"] and location == sig["location"]:
+                return True
+            continue
+        if body_hash and body_hash == sig["body_hash"]:
+            return True
+        if abs(length - sig["length"]) < 32:
+            return True
+    return False
+
+
+def _build_native_paths(wordlist_path, extensions, extra_words, max_paths):
+    """Construye la lista de rutas para el modo nativo: lee la wordlist real
+    (antes se ignoraba), agrega palabras del stack y variantes con extensión."""
+    base = []
+    if wordlist_path and Path(wordlist_path).exists():
+        try:
+            for line in Path(wordlist_path).read_text(encoding="utf-8", errors="replace").splitlines():
+                w = line.strip()
+                if w and not w.startswith("#"):
+                    base.append(w.lstrip("/"))
+        except Exception:
+            base = []
+    if not base:
+        base = BUILTIN_WORDLIST[:]
+    if extra_words:
+        base = list(dict.fromkeys(extra_words + base))
+
+    paths = list(dict.fromkeys(base))
+    if extensions:
+        with_ext = []
+        for word in paths[:400]:
+            if "." in word.rsplit("/", 1)[-1]:
+                continue
+            for ext in extensions:
+                with_ext.append(f"{word}.{ext}")
+        paths = list(dict.fromkeys(paths + with_ext))
+
+    truncated = False
+    if len(paths) > max_paths:
+        paths = paths[:max_paths]
+        truncated = True
+    return paths, truncated
+
+
+def run_fuzzing(url, extensions, threads, wordlist_path,
+                scan_id=None, phase=None, headers=None, max_depth=1,
+                emit_live=True, db=None):
+    import random as _random, string as _string, shutil as _shutil, threading as _threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    MAX_NATIVE_PATHS = 1500
+    MAX_RECURSE_DIRS = 25
+    REQ_BUDGET = 15000
+
+    def emit(ev, payload):
+        # En FASE 6 (emit_live=False) no inundamos el panel standalone.
+        if emit_live:
+            socketio.emit(ev, payload)
+
+    sid = _threading.get_ident()
+    active_fuzz[sid] = "running"
+    results = {"found": [], "total_requests": 0, "method": "", "filtered_count": 0,
+               "waf": None, "stack": None, "scan_id": scan_id}
+
+    url = url.rstrip('/')
+    extensions = [e for e in (extensions or []) if re.fullmatch(r"[A-Za-z0-9]{1,8}", e)]
+    headers = headers or {}
+    base_headers = {"User-Agent": "Mozilla/5.0"}
+    base_headers.update({k: v for k, v in headers.items() if isinstance(k, str) and isinstance(v, str)})
+
+    emit("fuzz_status", {"status": "running", "msg": "Preparando fuzzing..."})
+
+    use_ffuf = "ffuf" in run_argv(["ffuf", "-V"], timeout=8).lower()
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="sharingan-fuzz-"))
+
+    # Sesión de calibración (reusa conexión para WAF/stack/baseline)
+    calib_sess = requests.Session()
+    calib_sess.headers.update(base_headers)
+    calib_sess.verify = False
+
+    # ── WAF detection → concurrencia adaptativa ──
+    emit("fuzz_status", {"status": "running", "msg": "Detectando WAF / stack / catch-all..."})
+    waf = detect_waf(url, calib_sess)
+    # El clamp SOLO aplica si hay WAF positivamente identificado; un target
+    # limpio conserva los hilos del usuario (detect_waf devuelve concurrency=30
+    # por defecto y no queremos estrangular sitios sin WAF).
+    eff_threads = int(threads) if waf["waf"] is None else min(int(threads), waf["concurrency"])
+    delay_cfg = waf["delay"]
+    results["waf"] = waf["waf"]
+
+    # ── Stack fingerprint → rutas de alto valor por framework ──
+    stack, extra_words = fingerprint_stack(url, calib_sess)
+    results["stack"] = stack
+
+    info_bits = []
+    if waf["waf"]:
+        info_bits.append(f"WAF {waf['waf']} → {eff_threads} hilos")
+    if stack:
+        info_bits.append(f"Stack {stack} (+{len(extra_words)} rutas)")
+    if info_bits:
+        emit("fuzz_status", {"status": "running", "msg": " | ".join(info_bits)})
+
+    # Conexión de persistencia (propia del hilo si es standalone)
+    own_db = False
+    pdb = db
+    if pdb is None and scan_id is not None:
+        pdb = get_db()
+        own_db = True
+
+    def rank_key(x):
+        return (INTEREST_RANK.get(x.get("interest", "info"), 3), x.get("status", 0), x.get("path", ""))
+
+    # ───────────────────────── ffuf (shell=False) ─────────────────────────
     if use_ffuf and wordlist_path:
         results["method"] = "ffuf"
-        results["catch_all_size"] = catch_all_size
-        socketio.emit("fuzz_status", {"status": "running", "msg": "Ejecutando ffuf..."})
+        emit("fuzz_status", {"status": "running", "msg": "Ejecutando ffuf..."})
+
+        # Si el stack aportó rutas extra, se escriben a una wordlist combinada.
+        wl = wordlist_path
+        if extra_words:
+            try:
+                combined = tmpdir / "wordlist.txt"
+                orig = Path(wordlist_path).read_text(encoding="utf-8", errors="replace") if Path(wordlist_path).exists() else ""
+                merged = list(dict.fromkeys(extra_words + orig.splitlines()))
+                combined.write_text("\n".join(merged), encoding="utf-8")
+                wl = str(combined)
+            except Exception:
+                wl = wordlist_path
 
         output_file = tmpdir / "ffuf.json"
-        ext_flag = f' -e .{",".join(extensions)}' if extensions else ''
-        fs_flag = f' -fs {catch_all_size}' if catch_all_size is not None else ''
-        cmd = (f'ffuf -u "{url}/FUZZ" -w "{wordlist_path}" '
-               f'-o "{output_file}" -of json -mc all -fc 404{fs_flag} '
-               f'-t {threads} -timeout 10 -ac{ext_flag} -s')
+        argv = ["ffuf", "-u", f"{url}/FUZZ", "-w", wl,
+                "-o", str(output_file), "-of", "json",
+                "-mc", "all", "-fc", "404",
+                "-t", str(eff_threads), "-timeout", "10",
+                "-ac", "-s", "-maxtime", "480"]
+        if extensions:
+            # ffuf espera cada extensión con su punto: ".php,.bak,.env"
+            argv += ["-e", "." + ",.".join(extensions)]
+        if max_depth and max_depth > 1:
+            argv += ["-recursion", "-recursion-depth", str(int(max_depth)),
+                     "-recursion-strategy", "greedy"]
+        if delay_cfg and delay_cfg[1] > 0:
+            argv += ["-p", f"{delay_cfg[0]}-{delay_cfg[1]}"]
+        for k, v in base_headers.items():
+            if k.lower() == "user-agent":
+                continue
+            argv += ["-H", f"{k}: {v}"]
 
-        run_cmd(cmd)
+        run_argv(argv, timeout=540)
+
+        # Baseline calibrado para el filtrado (ffuf -ac no atrapa catch-all que
+        # reflejan el path ni targets que hacen 403 a todo). Comparamos por
+        # status + tamaño contra sondas aleatorias.
+        ff_baseline = get_baseline(url, calib_sess, extensions)
 
         if output_file.exists():
             try:
-                data = json.loads(output_file.read_text(encoding='utf-8', errors='replace'))
+                data = json.loads(output_file.read_text(encoding="utf-8", errors="replace"))
                 raw = data.get("results", []) or []
                 results["total_requests"] = data.get("numberofRequests", len(raw))
 
-                # ── Filtro por fingerprint de estructura (status, words, lines) ──
-                # Una SPA que refleja el path devuelve respuestas de TAMAÑO distinto
-                # (bytes varian) pero MISMA estructura: igual numero de palabras y
-                # lineas. Agrupamos por ese fingerprint y descartamos los clusters
-                # que dominan (= el mismo template catch-all repetido).
+                # Secundario: clusters dominantes por (status, words, lines) —
+                # atrapa SPAs 200 que reflejan el path (tamaño varía, estructura no).
+                # Umbral conservador para no borrar APIs reales con muchos 200 similares.
                 total_raw = len(raw)
                 fp_counts = {}
                 for r in raw:
                     fp = (r.get("status", 0), r.get("words", 0), r.get("lines", 0))
                     fp_counts[fp] = fp_counts.get(fp, 0) + 1
-
-                # Un fingerprint es "catch-all" si aparece muchas veces:
-                # >15 hits y >5% del total, o simplemente >200 hits.
-                catchall_fps = set()
-                for fp, c in fp_counts.items():
-                    if c > 200 or (c > 15 and total_raw and c / total_raw > 0.05):
-                        catchall_fps.add(fp)
+                catchall_fps = {fp for fp, c in fp_counts.items()
+                                if c > 200 or (c > 20 and total_raw and c / total_raw > 0.15)}
 
                 filtered = 0
                 for r in raw:
+                    path = r.get("input", {}).get("FUZZ", "")
+                    status = r.get("status", 0)
                     rlen = r.get("length", 0)
-                    fp = (r.get("status", 0), r.get("words", 0), r.get("lines", 0))
-                    # Descartar por tamaño exacto del catch-all calibrado
-                    if catch_all_size is not None and rlen == catch_all_size:
+                    redirect = r.get("redirectlocation", "")
+                    fp = (status, r.get("words", 0), r.get("lines", 0))
+                    # Primario: baseline por status/tamaño. Secundario: cluster dominante.
+                    if is_baseline(ff_baseline, path, status, rlen, "", redirect) or fp in catchall_fps:
                         filtered += 1
                         continue
-                    # Descartar por fingerprint de estructura dominante
-                    if fp in catchall_fps:
-                        filtered += 1
-                        continue
-                    entry = {
+                    sev, reason = classify_interest(path, status, rlen)
+                    # ffuf no entrega el cuerpo → no podemos confirmar unicidad
+                    # de contenido aquí (has_distinct_body=False → 'probable').
+                    vstatus, vreason = classify_discovery(status, has_distinct_body=False)
+                    results["found"].append({
                         "url": r.get("url", ""),
-                        "status": r.get("status", 0),
-                        "length": rlen,
-                        "words": r.get("words", 0),
-                        "lines": r.get("lines", 0),
-                        "path": r.get("input", {}).get("FUZZ", ""),
-                        "redirect": r.get("redirectlocation", ""),
-                        "type": categorize_path(
-                            r.get("input", {}).get("FUZZ", ""),
-                            r.get("redirectlocation", ""))
-                    }
-                    results["found"].append(entry)
+                        "status": status, "length": rlen,
+                        "words": r.get("words", 0), "lines": r.get("lines", 0),
+                        "path": path, "redirect": redirect,
+                        "type": categorize_path(path, redirect),
+                        "interest": sev, "interest_reason": reason,
+                        "validation_status": vstatus, "validation_reason": vreason,
+                    })
                 results["filtered_count"] = filtered
             except Exception:
                 pass
+
+    # ───────────────────────── nativo concurrente ─────────────────────────
     else:
         results["method"] = "python"
-        socketio.emit("fuzz_status", {"status": "running", "msg": "Fuzzing nativo (sin ffuf)..."})
+        paths, truncated = _build_native_paths(wordlist_path, extensions, extra_words, MAX_NATIVE_PATHS)
+        if truncated:
+            emit("fuzz_status", {"status": "running",
+                 "msg": f"Wordlist recortada a {MAX_NATIVE_PATHS} (modo nativo sin ffuf)"})
 
-        paths = BUILTIN_WORDLIST[:]
-        if extensions:
-            extra = []
-            for word in paths[:60]:
-                for ext in extensions:
-                    extra.append(f"{word}.{ext}")
-            paths.extend(extra)
+        tls = _threading.local()
 
-        total = len(paths)
-        for i, path in enumerate(paths):
-            if i % 25 == 0:
-                socketio.emit("fuzz_status", {
-                    "status": "running",
-                    "msg": f"Probando {i}/{total} paths..."
-                })
+        def worker_session():
+            s = getattr(tls, "s", None)
+            if s is None:
+                s = requests.Session()
+                s.headers.update(base_headers)
+                s.verify = False
+                a = requests.adapters.HTTPAdapter(pool_connections=eff_threads,
+                                                  pool_maxsize=eff_threads, max_retries=0)
+                s.mount("http://", a)
+                s.mount("https://", a)
+                tls.s = s
+            return s
+
+        def fetch(base, path):
+            s = worker_session()
+            if delay_cfg and delay_cfg[1] > 0:
+                time.sleep(_random.uniform(delay_cfg[0], delay_cfg[1]))
             try:
-                test_url = f"{url}/{path}"
-                resp = requests.get(test_url, timeout=5, allow_redirects=False,
-                                    headers={"User-Agent": "Mozilla/5.0"}, verify=False)
-                if resp.status_code != 404 and not (
-                        catch_all_size is not None and len(resp.content) == catch_all_size):
-                    redir = resp.headers.get("Location", "")
-                    entry = {
-                        "url": test_url,
-                        "status": resp.status_code,
-                        "length": len(resp.content),
-                        "words": len(resp.text.split()),
-                        "lines": len(resp.text.splitlines()),
-                        "path": path,
-                        "redirect": redir,
-                        "type": categorize_path(path, redir)
-                    }
-                    results["found"].append(entry)
-                    socketio.emit("fuzz_hit", entry)
+                r = s.get(f"{base}/{path}", timeout=(3.05, 5), allow_redirects=False)
+                return (base, path, r.status_code, r.content, r.text,
+                        r.headers.get("Location", ""))
             except Exception:
-                continue
-        results["total_requests"] = total
+                return None
 
-    results["found"].sort(key=lambda x: (x["status"], x["path"]))
-    socketio.emit("fuzz_result", results)
+        state = {"done": 0, "req": 0}
+        lock = _threading.Lock()
+        baselines = {url: get_baseline(url, calib_sess, extensions)}
+        bases = [(url, 0)]
+        visited_bases = {url}
+
+        while bases:
+            if active_fuzz.get(sid) == "cancelled":
+                break
+            next_bases = []
+            # Procesar las bases de esta profundidad, cada una concurrentemente.
+            round_total = len(bases) * len(paths)
+            for base, depth in bases:
+                if active_fuzz.get(sid) == "cancelled" or state["req"] >= REQ_BUDGET:
+                    break
+                bl = baselines.get(base)
+                if bl is None:
+                    bl = get_baseline(base, calib_sess, extensions)
+                    baselines[base] = bl
+                with ThreadPoolExecutor(max_workers=eff_threads) as pool:
+                    futs = [pool.submit(fetch, base, p) for p in paths]
+                    for fut in as_completed(futs):
+                        with lock:
+                            state["done"] += 1
+                            state["req"] += 1
+                            done = state["done"]
+                        if done % 50 == 0:
+                            emit("fuzz_status", {"status": "running",
+                                 "msg": f"Profundidad {depth}: {done} peticiones... "
+                                        f"({len(results['found'])} hits)"})
+                        res = fut.result()
+                        if not res:
+                            continue
+                        rbase, path, status, content, text, location = res
+                        if status == 404:
+                            continue
+                        bh = _body_hash(content)
+                        if is_baseline(bl, path, status, len(content), bh, location):
+                            results["filtered_count"] += 1
+                            continue
+                        hit_url = f"{rbase}/{path}"
+                        # Ruta completa relativa al objetivo original (no solo el
+                        # segmento hoja) para que /admin/config no se vea como /config
+                        # y la clasificación de interés tenga el path completo.
+                        full_path = hit_url[len(url):].lstrip("/") if hit_url.startswith(url) else path
+                        sev, reason = classify_interest(full_path, status, len(content))
+                        # Modo nativo SÍ tiene el cuerpo y ya pasó is_baseline →
+                        # un 200 aquí tiene contenido distinto del catch-all.
+                        vstatus, vreason = classify_discovery(status, has_distinct_body=True)
+                        entry = {
+                            "url": hit_url, "status": status,
+                            "length": len(content), "words": len(text.split()),
+                            "lines": len(text.splitlines()), "path": full_path,
+                            "redirect": location, "type": categorize_path(full_path, location),
+                            "interest": sev, "interest_reason": reason,
+                            "validation_status": vstatus, "validation_reason": vreason,
+                        }
+                        results["found"].append(entry)
+                        emit("fuzz_hit", entry)
+                        # ¿Recursar? Solo directorios reales con status jugoso.
+                        if (depth + 1 < (max_depth or 1)
+                                and status in (200, 301, 302, 403)
+                                and entry["type"] in ("directory", "redirect")
+                                and len(next_bases) < MAX_RECURSE_DIRS):
+                            child = hit_url.rstrip("/")
+                            if child not in visited_bases:
+                                visited_bases.add(child)
+                                next_bases.append((child, depth + 1))
+            # Filtrar hijos que resulten ser catch-all (evita dirs fantasma).
+            filtered_children = []
+            for child, d in next_bases:
+                cbl = get_baseline(child, calib_sess, extensions)
+                baselines[child] = cbl
+                is_ca = any(s["status"] in (200, 201, 204)
+                            for sigs in cbl.values() for s in sigs)
+                if not is_ca:
+                    filtered_children.append((child, d))
+            bases = filtered_children
+        results["total_requests"] = state["req"]
+
+    # ── Orden por interés, luego status, luego path ──
+    results["found"].sort(key=rank_key)
+
+    # ── Persistencia opcional (standalone con scan_id, o FASE 6) ──
+    if pdb is not None and scan_id is not None:
+        try:
+            from urllib.parse import urlparse as _up
+            host = _up(url).netloc or url
+            src = "fuzz" if phase is None else f"scan-fase{phase}"
+            rows = []
+            for e in results["found"]:
+                ev = json.dumps({
+                    "interest": e.get("interest"), "reason": e.get("interest_reason"),
+                    "validation_reason": e.get("validation_reason"),
+                    "length": e.get("length"), "words": e.get("words"),
+                    "lines": e.get("lines"), "type": e.get("type"),
+                    "waf": results.get("waf"), "stack": results.get("stack"),
+                }, ensure_ascii=False)
+                rows.append((scan_id, host, e["path"], e["status"], e["length"], e["words"],
+                             e["lines"], e["type"], e["redirect"], "", "", "", "",
+                             e.get("interest", "info"), src, None,
+                             e.get("validation_status", "probable"), ev))
+            pdb.executemany(
+                """INSERT INTO directories
+                   (scan_id, host, path, status_code, content_length, words, lines,
+                    type, redirect, title, server, tech, content_type, interest,
+                    source, likely_real, validation_status, evidence)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            # Si es un fuzz standalone (no una fase del scan), cerramos su fila
+            # scans; antes quedaba en 'running' para siempre.
+            if phase is None:
+                pdb.execute("UPDATE scans SET status='done', finished_at=? WHERE id=?",
+                            (datetime.now().isoformat(), scan_id))
+            pdb.commit()
+        except Exception:
+            pass
+        finally:
+            if own_db:
+                try:
+                    pdb.close()
+                except Exception:
+                    pass
+
+    emit("fuzz_result", results)
     filt = results.get("filtered_count", 0)
+    hv = sum(1 for e in results["found"] if e.get("interest") in ("critical", "high"))
     done_msg = f"Fuzzing completado: {len(results['found'])} encontrados"
+    if hv:
+        done_msg += f", {hv} de alto valor"
     if filt:
         done_msg += f" ({filt} descartados como catch-all)"
-    socketio.emit("fuzz_status", {"status": "done", "msg": done_msg})
+    emit("fuzz_status", {"status": "done", "msg": done_msg})
+    active_fuzz.pop(sid, None)
 
-    import shutil
     try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        _shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
         pass
+    return results
 
 
 # ── 403 Bypass ──
@@ -1592,12 +2363,14 @@ BYPASS_TECHNIQUES = [
 ]
 
 
-def run_403_bypass(url):
+def run_403_bypass(url, headers=None):
     socketio.emit("bypass_status", {"status": "running", "msg": "Iniciando 403 bypass..."})
     results = []
     total = len(BYPASS_TECHNIQUES)
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    if headers:
+        session.headers.update({k: v for k, v in headers.items() if isinstance(k, str) and isinstance(v, str)})
     session.verify = False
 
     from urllib.parse import urlparse
@@ -1737,29 +2510,94 @@ def run_403_bypass(url):
     })
 
 
+def _parse_headers(data):
+    """Headers de la UI (texto 'Name: Value' por línea o dict). Solo vienen del
+    input del usuario, nunca de contenido escaneado."""
+    raw = data.get("headers")
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                out[k.strip()] = v.strip()
+    elif isinstance(raw, str):
+        for line in raw.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                if k.strip():
+                    out[k.strip()] = v.strip()
+    cookie = (data.get("cookie") or "").strip()
+    if cookie:
+        out["Cookie"] = cookie
+    return out
+
+
 @socketio.on("start_bypass")
 def handle_bypass(data):
-    url = data.get("url", "").strip()
+    url = (data.get("url") or "").strip()
     if not url:
         return
     if not url.startswith("http"):
         url = "https://" + url
-    threading.Thread(target=run_403_bypass, args=(url,), daemon=True).start()
+    ok, msg = _assert_public_target(url)
+    if not ok:
+        socketio.emit("bypass_status", {"status": "done", "msg": f"Objetivo bloqueado: {msg}"})
+        return
+    headers = _parse_headers(data)
+    threading.Thread(target=run_403_bypass, args=(url,), kwargs={"headers": headers}, daemon=True).start()
 
 
 @socketio.on("start_fuzzing")
 def handle_fuzzing(data):
-    url = data.get("url", "").strip()
+    url = (data.get("url") or "").strip()
     if not url:
         return
     if not url.startswith("http"):
         url = "https://" + url
-    extensions = data.get("extensions", [])
-    threads = min(data.get("threads", 40), 100)
-    wordlist = data.get("wordlist", "").strip()
+    ok, msg = _assert_public_target(url)
+    if not ok:
+        socketio.emit("fuzz_status", {"status": "done", "msg": f"Objetivo bloqueado: {msg}"})
+        return
+    # Extensiones: allowlist estricta (evita inyección aunque un cliente no-UI mande basura).
+    extensions = [e for e in data.get("extensions", [])
+                  if isinstance(e, str) and re.fullmatch(r"[A-Za-z0-9]{1,8}", e)]
+    try:
+        threads = min(max(int(data.get("threads", 40)), 1), 100)
+    except (TypeError, ValueError):
+        threads = 40
+    try:
+        max_depth = min(max(int(data.get("max_depth", 1)), 1), 3)
+    except (TypeError, ValueError):
+        max_depth = 1
+    wordlist = (data.get("wordlist") or "").strip()
     if not wordlist or not Path(wordlist).exists():
         wordlist = find_wordlist()
-    threading.Thread(target=run_fuzzing, args=(url, extensions, threads, wordlist), daemon=True).start()
+    headers = _parse_headers(data)
+
+    # Persistir resultados: crear una fila scans (mode='fuzz') y pasar su id.
+    scan_id = None
+    try:
+        sdb = get_db()
+        cur = sdb.execute(
+            "INSERT INTO scans (domain, status, mode, started_at) VALUES (?,?,?,?)",
+            (url, "running", "fuzz", datetime.now().isoformat()))
+        scan_id = cur.lastrowid
+        sdb.commit()
+        sdb.close()
+    except Exception:
+        scan_id = None
+
+    threading.Thread(
+        target=run_fuzzing, args=(url, extensions, threads, wordlist),
+        kwargs={"scan_id": scan_id, "headers": headers, "max_depth": max_depth},
+        daemon=True).start()
+
+
+@socketio.on("stop_fuzzing")
+def handle_stop_fuzzing(data):
+    # Marca cancelación; el bucle nativo la chequea por hilo.
+    for k in list(active_fuzz.keys()):
+        active_fuzz[k] = "cancelled"
+    socketio.emit("fuzz_status", {"status": "running", "msg": "Cancelando fuzzing..."})
 
 
 # ── httpx verification (enriquece resultados del fuzzing) ──
@@ -1767,21 +2605,28 @@ def handle_fuzzing(data):
 def _httpx_available():
     """Detecta si httpx.exe se puede ejecutar (no bloqueado por Device Guard)."""
     try:
-        r = subprocess.run("httpx -version", shell=True, capture_output=True,
-                           text=True, timeout=10, env=get_env())
-        out = (r.stdout + r.stderr).lower()
+        out = run_argv(["httpx", "-version"], timeout=10).lower()
         if "bloqueado" in out or "device guard" in out or "blocked" in out:
             return False
-        return r.returncode == 0 or "version" in out
+        return "version" in out or bool(re.search(r"v\d+\.\d+", out))
     except Exception:
         return False
 
 
-def _verify_url_python(url, session):
-    """Fallback: obtiene status, tamaño, title, server via requests."""
+def _verify_url_python(url, session, headers=None):
+    """Probe compartido: status, tamaño, title, server, hash de cuerpo.
+
+    allow_redirects=False: NO seguimos redirects — un 302 a un host interno
+    (169.254.169.254, localhost) bypasearía el gate SSRF. Además, para verificar
+    un recurso descubierto, el status real (301/302) es más informativo que
+    seguir hasta el destino.
+    """
     try:
-        resp = session.get(url, timeout=8, allow_redirects=True,
-                           headers={"User-Agent": "Mozilla/5.0"}, verify=False)
+        h = {"User-Agent": "Mozilla/5.0"}
+        if headers:
+            h.update(headers)
+        resp = session.get(url, timeout=8, allow_redirects=False,
+                           headers=h, verify=False)
         body = resp.text
         title = ""
         m = re.search(r'<title[^>]*>(.*?)</title>', body, re.IGNORECASE | re.DOTALL)
@@ -1807,12 +2652,13 @@ def _verify_url_python(url, session):
             "tech": ", ".join(dict.fromkeys(tech)),
             "content_type": resp.headers.get("Content-Type", "").split(';')[0],
             "location": resp.headers.get("Location", ""),
+            "body_hash": _body_hash(resp.content),
         }
     except Exception:
         return None
 
 
-def run_httpx_verify(urls):
+def run_httpx_verify(urls, headers=None):
     enriched = []
     tmpdir = None
     try:
@@ -1820,15 +2666,19 @@ def run_httpx_verify(urls):
 
         if use_httpx:
             socketio.emit("httpx_status", {"status": "running", "msg": f"Verificando {len(urls)} URLs con httpx..."})
-            tmpdir = Path.home() / "AppData" / "Local" / "Temp" / f"sharingan-httpx-{int(time.time())}"
-            tmpdir.mkdir(parents=True, exist_ok=True)
+            tmpdir = Path(tempfile.mkdtemp(prefix="sharingan-httpx-"))
             in_file = tmpdir / "urls.txt"
             out_file = tmpdir / "httpx.json"
             in_file.write_text("\n".join(urls), encoding="utf-8")
 
-            cmd = (f'httpx -l "{in_file}" -json -o "{out_file}" '
-                   f'-sc -cl -title -td -server -location -ct -nc -silent -t 50')
-            run_cmd(cmd)
+            argv = ["httpx", "-l", str(in_file), "-json", "-o", str(out_file),
+                    "-sc", "-cl", "-title", "-td", "-server", "-location",
+                    "-ct", "-nc", "-silent", "-t", "50"]
+            if headers:
+                for k, v in headers.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        argv += ["-H", f"{k}: {v}"]
+            run_argv(argv, timeout=540)
 
             if out_file.exists():
                 for line in out_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1857,11 +2707,17 @@ def run_httpx_verify(urls):
                 "msg": f"httpx no disponible (bloqueado) - verificando {len(urls)} URLs con Python..."
             })
             from concurrent.futures import ThreadPoolExecutor, as_completed
+            WORKERS = 30
             session = requests.Session()
             session.headers.update({"User-Agent": "Mozilla/5.0"})
+            # pool_maxsize == workers: evita "Connection pool is full" y el
+            # churn de sockets que colapsaba la concurrencia a ~10.
+            _ad = requests.adapters.HTTPAdapter(pool_connections=WORKERS, pool_maxsize=WORKERS, max_retries=0)
+            session.mount("http://", _ad)
+            session.mount("https://", _ad)
             done = 0
-            with ThreadPoolExecutor(max_workers=30) as pool:
-                futures = {pool.submit(_verify_url_python, u, session): u for u in urls}
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                futures = {pool.submit(_verify_url_python, u, session, headers): u for u in urls}
                 for fut in as_completed(futures):
                     done += 1
                     if done % 25 == 0:
@@ -1884,6 +2740,12 @@ def run_httpx_verify(urls):
             fp = (e["status"], e.get("words", 0), e.get("lines", 0))
             e["dup_count"] = fp_counts.get(fp, 1)
             e["likely_real"] = e["dup_count"] <= 3
+            # Veredicto de validación central a partir de la señal httpx.
+            vstatus, vreason = classify_discovery(
+                e.get("status"), has_distinct_body=True,
+                httpx_likely_real=e["likely_real"])
+            e["validation_status"] = vstatus
+            e["validation_reason"] = vreason
 
         enriched.sort(key=lambda x: (not x["likely_real"], x["status"], x["path"]))
         real_n = sum(1 for e in enriched if e["likely_real"])
@@ -1911,11 +2773,19 @@ def run_httpx_verify(urls):
 @socketio.on("start_httpx_verify")
 def handle_httpx_verify(data):
     urls = data.get("urls", [])
-    urls = [u for u in urls if u and u.startswith("http")][:3000]
+    # Gate SSRF por URL (misma defensa que fuzzing/bypass).
+    clean = []
+    for u in urls:
+        if u and u.startswith("http"):
+            ok, _ = _assert_public_target(u)
+            if ok:
+                clean.append(u)
+    urls = clean[:3000]
     if not urls:
-        socketio.emit("httpx_status", {"status": "done", "msg": "No hay URLs para verificar"})
+        socketio.emit("httpx_status", {"status": "done", "msg": "No hay URLs válidas para verificar (todas bloqueadas por el filtro SSRF)"})
         return
-    threading.Thread(target=run_httpx_verify, args=(urls,), daemon=True).start()
+    headers = _parse_headers(data)
+    threading.Thread(target=run_httpx_verify, args=(urls,), kwargs={"headers": headers}, daemon=True).start()
 
 
 def update_scan(scan_id, **kwargs):
@@ -1944,14 +2814,15 @@ def run_scan(scan_id, domain, phases):
             run_fingerprint(db, scan_id, domain)
             socketio.emit("stats_update", {"scan_id": scan_id, "info": True})
 
-            out = run_cmd(f'curl -s "https://crt.sh/?q=%25.{domain}&output=json"')
+            out, _st = run_argv_cancel(["curl", "-s", f"https://crt.sh/?q=%25.{domain}&output=json"],
+                                       scan_id=scan_id, timeout=60)
             try:
                 data = json.loads(out)
                 names = sorted(set(
                     n.strip().lower()
                     for entry in data
                     for n in entry.get("name_value", "").split("\n")
-                    if domain in n.lower() and "*" not in n
+                    if "*" not in n and _in_scope(n, domain)
                 ))
                 for name in names:
                     db.execute("INSERT INTO subdomains (scan_id, subdomain, source) VALUES (?, ?, ?)",
@@ -1971,45 +2842,81 @@ def run_scan(scan_id, domain, phases):
             update_scan(scan_id, current_phase=2)
             socketio.emit("phase_status", {"scan_id": scan_id, "phase": 2, "status": "running"})
 
+            # Recolección por fuente, con scope anclado por sufijo (#7).
+            candidates = {}  # subdominio -> fuente (la primera que lo vio)
+            notes = []
+
+            def add_candidates(lines, source):
+                for line in lines:
+                    s = line.strip().lower().rstrip(".")
+                    if s and _in_scope(s, domain):
+                        candidates.setdefault(s, source)
+
+            # crt.sh (FASE 1) ya insertó; lo traemos al set para resolver todo junto.
+            for r in db.execute("SELECT subdomain, source FROM subdomains WHERE scan_id=?", (scan_id,)).fetchall():
+                candidates.setdefault(r["subdomain"], r["source"])
+            db.execute("DELETE FROM subdomains WHERE scan_id=?", (scan_id,))
+
             sf_file = tmpdir / "subfinder.txt"
-            run_cmd(f'subfinder -d {domain} -all -o "{sf_file}" -silent')
+            _, st = run_argv_cancel(["subfinder", "-d", domain, "-all", "-o", str(sf_file), "-silent"],
+                                    scan_id=scan_id, timeout=300)
+            if st in ("error", "timeout"):
+                notes.append(f"subfinder: {st}")
             if sf_file.exists():
-                for line in sf_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                    s = line.strip().lower()
-                    if s and domain in s:
-                        db.execute("INSERT INTO subdomains (scan_id, subdomain, source) VALUES (?, ?, ?)",
-                                   (scan_id, s, "subfinder"))
-                db.commit()
+                add_candidates(sf_file.read_text(encoding="utf-8", errors="replace").splitlines(), "subfinder")
 
             sl_file = tmpdir / "sublist3r.txt"
-            run_cmd(f'python -m sublist3r -d {domain} -o "{sl_file}"')
+            _, st = run_argv_cancel(["python", "-m", "sublist3r", "-d", domain, "-o", str(sl_file)],
+                                    scan_id=scan_id, timeout=300)
+            if st in ("error", "timeout"):
+                notes.append(f"sublist3r: {st}")
             if sl_file.exists():
-                for line in sl_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                    s = line.strip().lower()
-                    if s and domain in s:
-                        db.execute("INSERT INTO subdomains (scan_id, subdomain, source) VALUES (?, ?, ?)",
-                                   (scan_id, s, "sublist3r"))
-                db.commit()
+                add_candidates(sl_file.read_text(encoding="utf-8", errors="replace").splitlines(), "sublist3r")
 
-            af_out = run_cmd(f'assetfinder --subs-only {domain}')
-            for line in af_out.splitlines():
-                s = line.strip().lower()
-                if s and domain in s:
-                    db.execute("INSERT INTO subdomains (scan_id, subdomain, source) VALUES (?, ?, ?)",
-                               (scan_id, s, "assetfinder"))
+            af_out, st = run_argv_cancel(["assetfinder", "--subs-only", domain], scan_id=scan_id, timeout=120)
+            if st in ("error", "timeout"):
+                notes.append(f"assetfinder: {st}")
+            add_candidates(af_out.splitlines(), "assetfinder")
+
+            # ── #7: wildcard DNS + resolución ──
+            wildcard_ips = detect_wildcard_dns(domain)
+            if wildcard_ips:
+                notes.append(f"wildcard DNS detectado ({len(wildcard_ips)} IP) — fantasmas marcados")
+            socketio.emit("phase_status", {"scan_id": scan_id, "phase": 2, "status": "running",
+                          "note": f"Resolviendo {len(candidates)} subdominios..."})
+
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            cand_list = list(candidates.keys())
+            resolved_map = {}
+            if cand_list:
+                with _TPE(max_workers=40) as pool:
+                    for sub, ips in zip(cand_list, pool.map(_resolve_host, cand_list)):
+                        resolved_map[sub] = ips
+
+            rows = []
+            n_res = n_wild = 0
+            for sub in cand_list:
+                ips = resolved_map.get(sub, set())
+                resolved = 1 if ips else 0
+                is_wild = 1 if (ips and wildcard_ips and ips <= wildcard_ips) else 0
+                is_int = 1 if (ips and _ips_internal(ips)) else 0
+                if resolved:
+                    n_res += 1
+                if is_wild:
+                    n_wild += 1
+                rows.append((scan_id, sub, candidates[sub],
+                             ", ".join(sorted(ips))[:200], resolved, is_wild, is_int))
+            db.executemany(
+                """INSERT INTO subdomains (scan_id, subdomain, source, ip, resolved, is_wildcard, is_internal)
+                   VALUES (?,?,?,?,?,?,?)""", rows)
             db.commit()
 
-            # Deduplicate
-            db.execute("""
-                DELETE FROM subdomains WHERE id NOT IN (
-                    SELECT MIN(id) FROM subdomains WHERE scan_id = ? GROUP BY subdomain
-                ) AND scan_id = ?
-            """, (scan_id, scan_id))
-            db.commit()
-
-            count = db.execute("SELECT COUNT(*) FROM subdomains WHERE scan_id = ?", (scan_id,)).fetchone()[0]
+            count = len(rows)
             socketio.emit("stats_update", {"scan_id": scan_id, "subdomains": count})
-            socketio.emit("phase_status", {"scan_id": scan_id, "phase": 2, "status": "done"})
+            done_note = f"{count} únicos · {n_res} resuelven · {n_wild} wildcard/fantasma"
+            if notes:
+                done_note += " · " + "; ".join(notes)
+            socketio.emit("phase_status", {"scan_id": scan_id, "phase": 2, "status": "done", "note": done_note})
 
         if active_scans.get(scan_id) == "cancelled":
             update_scan(scan_id, status="cancelled")
@@ -2020,15 +2927,24 @@ def run_scan(scan_id, domain, phases):
             update_scan(scan_id, current_phase=3)
             socketio.emit("phase_status", {"scan_id": scan_id, "phase": 3, "status": "running"})
 
+            # #7: solo hosts que resuelven, NO wildcard, NO internos (SSRF).
             subs = [r["subdomain"] for r in db.execute(
-                "SELECT DISTINCT subdomain FROM subdomains WHERE scan_id = ?", (scan_id,)).fetchall()]
+                """SELECT DISTINCT subdomain FROM subdomains
+                   WHERE scan_id = ? AND resolved = 1
+                     AND (is_wildcard IS NULL OR is_wildcard = 0)
+                     AND (is_internal IS NULL OR is_internal = 0)""", (scan_id,)).fetchall()]
 
             if subs:
                 subs_file = tmpdir / "subs.txt"
                 subs_file.write_text("\n".join(subs), encoding="utf-8")
 
                 httpx_file = tmpdir / "httpx.json"
-                run_cmd(f'httpx -l "{subs_file}" -json -o "{httpx_file}" -sc -cl -title -td -server -nc -silent')
+                _, st = run_argv_cancel(["httpx", "-l", str(subs_file), "-json", "-o", str(httpx_file),
+                          "-sc", "-cl", "-title", "-td", "-server", "-nc", "-silent"],
+                          scan_id=scan_id, timeout=600)
+                if st in ("error", "timeout"):
+                    socketio.emit("phase_status", {"scan_id": scan_id, "phase": 3, "status": "running",
+                                  "note": f"httpx: {st}"})
 
                 if httpx_file.exists():
                     for line in httpx_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -2065,12 +2981,19 @@ def run_scan(scan_id, domain, phases):
             hosts = set()
             for r in db.execute("SELECT url FROM alive_hosts WHERE scan_id = ?", (scan_id,)).fetchall():
                 h = re.sub(r'https?://', '', r["url"]).split('/')[0].split(':')[0]
-                hosts.add(h)
+                # #7/SSRF: no escanear hosts que resuelven a IP interna.
+                ok, _ = _assert_public_target("https://" + h)
+                if ok:
+                    hosts.add(h)
 
             if hosts:
                 hosts_file = tmpdir / "hosts.txt"
                 hosts_file.write_text("\n".join(sorted(hosts)), encoding="utf-8")
-                nmap_out = run_cmd(f'nmap -sV -T4 --top-ports 100 -iL "{hosts_file}"')
+                nmap_out, st = run_argv_cancel(["nmap", "-sV", "-T4", "--top-ports", "100", "-iL", str(hosts_file)],
+                                               scan_id=scan_id, timeout=600)
+                if st in ("error", "timeout"):
+                    socketio.emit("phase_status", {"scan_id": scan_id, "phase": 4, "status": "running",
+                                  "note": f"nmap: {st}"})
 
                 current_host = ""
                 for line in nmap_out.splitlines():
@@ -2108,22 +3031,44 @@ def run_scan(scan_id, domain, phases):
                 alive_file = tmpdir / "alive.txt"
                 alive_file.write_text("\n".join(alive), encoding="utf-8")
                 nuclei_file = tmpdir / "nuclei.json"
-                run_cmd(f'nuclei -l "{alive_file}" -jsonl -o "{nuclei_file}" -es info -rl 30 -nc -silent')
+                _, st = run_argv_cancel(["nuclei", "-l", str(alive_file), "-jsonl", "-o", str(nuclei_file),
+                          "-es", "info", "-rl", "30", "-nc", "-silent"], scan_id=scan_id, timeout=600)
+                if st in ("error", "timeout"):
+                    socketio.emit("phase_status", {"scan_id": scan_id, "phase": 5, "status": "running",
+                                  "note": f"nuclei: {st}"})
 
                 if nuclei_file.exists():
                     for line in nuclei_file.read_text(encoding="utf-8", errors="replace").splitlines():
                         try:
                             j = json.loads(line)
                             info = j.get("info", {})
-                            db.execute("""INSERT INTO vulns
-                                (scan_id, template, severity, host, info, matched_at)
-                                VALUES (?, ?, ?, ?, ?, ?)""", (
+                            sev = info.get("severity", "unknown")
+                            vstatus, vreason = classify_vuln(sev, j.get("matched-at"))
+                            # Evidencia completa para triage (antes se descartaba).
+                            classification = info.get("classification", {}) or {}
+                            ev = json.dumps({
+                                "matcher": j.get("matcher-name", ""),
+                                "extracted": j.get("extracted-results", []),
+                                "cve": classification.get("cve-id", []),
+                                "cwe": classification.get("cwe-id", []),
+                                "cvss_score": classification.get("cvss-score"),
+                                "reference": info.get("reference", []),
+                                "description": (info.get("description", "") or "")[:500],
+                                "curl": j.get("curl-command", ""),
+                                "type": j.get("type", ""),
+                                "validation_reason": vreason,
+                            }, ensure_ascii=False)
+                            db.execute("""INSERT OR IGNORE INTO vulns
+                                (scan_id, template, severity, host, info, matched_at,
+                                 validation_status, evidence)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
                                 scan_id,
                                 j.get("template-id", ""),
-                                info.get("severity", "unknown"),
+                                sev,
                                 j.get("host", ""),
                                 info.get("name", ""),
-                                j.get("matched-at", "")
+                                j.get("matched-at", ""),
+                                vstatus, ev
                             ))
                         except Exception:
                             pass
@@ -2144,17 +3089,21 @@ def run_scan(scan_id, domain, phases):
 
             alive = [r["url"] for r in db.execute(
                 "SELECT url FROM alive_hosts WHERE scan_id = ?", (scan_id,)).fetchall()]
+            wl = find_wordlist()
             for host in alive[:5]:
-                safe = re.sub(r'[^\w\-.]', '_', host)
-                dir_file = tmpdir / f"dirs-{safe}.txt"
-                run_cmd(f'python -m dirsearch -u {host} --format plain -o "{dir_file}" -q')
-                if dir_file.exists():
-                    for line in dir_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                        m = re.match(r'(\d{3})\s+\S+\s+\S+\s+(/.+)', line)
-                        if m:
-                            db.execute("""INSERT INTO directories (scan_id, host, path, status_code)
-                                VALUES (?, ?, ?, ?)""", (scan_id, host, m.group(2).strip(), int(m.group(1))))
-                    db.commit()
+                if active_scans.get(scan_id) == "cancelled":
+                    break
+                ok, _ = _assert_public_target(host)
+                if not ok:
+                    continue
+                # Reusa el MISMO motor que el fuzzing interactivo (calibración
+                # soft-404, filtro catch-all, clasificación de interés, persistencia)
+                # pero en silencio (emit_live=False) para no tocar el panel standalone.
+                try:
+                    run_fuzzing(host, ["php", "bak", "env", "json"], 40, wl,
+                                scan_id=scan_id, phase=6, emit_live=False, db=db)
+                except Exception:
+                    pass
 
             count = db.execute("SELECT COUNT(*) FROM directories WHERE scan_id = ?", (scan_id,)).fetchone()[0]
             socketio.emit("stats_update", {"scan_id": scan_id, "dirs": count})
@@ -2174,8 +3123,8 @@ def run_scan(scan_id, domain, phases):
             file_patterns = [".php", ".asp", ".jsp", ".json", ".xml", ".config", ".env",
                              ".bak", ".sql", ".log", ".git", ".zip", ".tar"]
 
-            wb_out = run_cmd(f'waybackurls {domain}')
-            gau_out = run_cmd(f'gau {domain}')
+            wb_out, _ = run_argv_cancel(["waybackurls", domain], scan_id=scan_id, timeout=300)
+            gau_out, _ = run_argv_cancel(["gau", domain], scan_id=scan_id, timeout=300)
 
             all_urls = set()
             for line in (wb_out + "\n" + gau_out).splitlines():
@@ -2216,6 +3165,7 @@ def run_scan(scan_id, domain, phases):
         socketio.emit("scan_error", {"scan_id": scan_id, "error": str(e)})
     finally:
         db.close()
+        active_scans.pop(scan_id, None)  # #8: evitar crecimiento ilimitado
         import shutil
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2234,18 +3184,15 @@ def index():
 def tools_status():
     tools = ["subfinder", "sublist3r", "assetfinder", "httpx", "nmap", "nuclei", "ffuf", "dirsearch", "waybackurls", "gau", "whois"]
     cmds = {
-        "subfinder": "subfinder -version", "sublist3r": "python -m sublist3r --help",
-        "assetfinder": "assetfinder -h", "httpx": "httpx -version", "nmap": "nmap --version",
-        "nuclei": "nuclei -version", "ffuf": "ffuf -V", "dirsearch": "python -m dirsearch --help",
-        "waybackurls": "waybackurls -h", "gau": "gau --help", "whois": "whois -?",
+        "subfinder": ["subfinder", "-version"], "sublist3r": ["python", "-m", "sublist3r", "--help"],
+        "assetfinder": ["assetfinder", "-h"], "httpx": ["httpx", "-version"], "nmap": ["nmap", "--version"],
+        "nuclei": ["nuclei", "-version"], "ffuf": ["ffuf", "-V"], "dirsearch": ["python", "-m", "dirsearch", "--help"],
+        "waybackurls": ["waybackurls", "-h"], "gau": ["gau", "--help"], "whois": ["whois", "-?"],
     }
     results = {}
     for name in tools:
-        try:
-            r = subprocess.run(cmds[name], shell=True, capture_output=True, text=True, timeout=10, env=get_env())
-            results[name] = r.returncode == 0 or len(r.stdout + r.stderr) > 0
-        except Exception:
-            results[name] = False
+        out = run_argv(cmds[name], timeout=10)
+        results[name] = not out.startswith("Error:") and len(out.strip()) > 0
     return jsonify(results)
 
 
@@ -2276,15 +3223,25 @@ def get_scan(scan_id):
         return jsonify({"error": "not found"}), 404
     result = dict(scan)
     result["subdomains"] = [dict(r) for r in db.execute(
-        "SELECT subdomain, source FROM subdomains WHERE scan_id=? ORDER BY subdomain", (scan_id,)).fetchall()]
+        """SELECT subdomain, source, ip, resolved, is_wildcard, is_internal
+           FROM subdomains WHERE scan_id=?
+           ORDER BY is_wildcard, resolved DESC, subdomain""", (scan_id,)).fetchall()]
     result["alive_hosts"] = [dict(r) for r in db.execute(
         "SELECT url, status_code, title, tech, server, content_length FROM alive_hosts WHERE scan_id=?", (scan_id,)).fetchall()]
     result["ports"] = [dict(r) for r in db.execute(
         "SELECT host, port, state, service, version FROM ports WHERE scan_id=? ORDER BY port", (scan_id,)).fetchall()]
     result["vulns"] = [dict(r) for r in db.execute(
-        "SELECT template, severity, host, info, matched_at FROM vulns WHERE scan_id=? ORDER BY severity", (scan_id,)).fetchall()]
+        """SELECT template, severity, host, info, matched_at, validation_status, evidence
+           FROM vulns WHERE scan_id=?
+           ORDER BY CASE lower(severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2 WHEN 'low' THEN 3 WHEN 'info' THEN 4 ELSE 5 END""",
+        (scan_id,)).fetchall()]
     result["directories"] = [dict(r) for r in db.execute(
-        "SELECT host, path, status_code FROM directories WHERE scan_id=? ORDER BY status_code", (scan_id,)).fetchall()]
+        """SELECT host, path, status_code, content_length, type, redirect, interest, source,
+                  validation_status, evidence
+           FROM directories WHERE scan_id=?
+           ORDER BY CASE interest WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2 ELSE 3 END, status_code""", (scan_id,)).fetchall()]
     result["urls"] = [dict(r) for r in db.execute(
         "SELECT url, source, category FROM urls WHERE scan_id=? ORDER BY category, url", (scan_id,)).fetchall()]
     info_rows = db.execute("SELECT category, key, value FROM recon_info WHERE scan_id=? ORDER BY category, key", (scan_id,)).fetchall()
@@ -2316,7 +3273,19 @@ def handle_start(data):
     if not domain:
         emit("error", {"message": "Dominio requerido"})
         return
-    domain = re.sub(r'^https?://', '', domain).split('/')[0]
+    domain = re.sub(r'^https?://', '', domain).split('/')[0].split(':')[0]
+    # ── P0: allowlist estricta de hostname ──
+    # El dominio se interpola en comandos y en DNS; restringirlo a
+    # [a-z0-9.-] (sin espacios, comillas, &, |, ;, $, backticks) neutraliza
+    # de raíz la inyección de comandos y de PowerShell en TODO el scan.
+    if not re.fullmatch(r"(?=.{1,253}$)([a-z0-9_-]{1,63}\.)+[a-z]{2,}", domain):
+        emit("error", {"message": f"Dominio inválido: {domain}. Usá un hostname (ej: ejemplo.com)."})
+        return
+    # ── P0: gate SSRF también en el target del scan ──
+    ok, msg = _assert_public_target("https://" + domain)
+    if not ok:
+        emit("error", {"message": f"Objetivo bloqueado: {msg}"})
+        return
     phases = data.get("phases", [1, 2, 3, 4, 5, 6, 7])
 
     db = get_db()
@@ -2344,5 +3313,5 @@ def handle_cancel(data):
 
 if __name__ == "__main__":
     init_db()
-    print("\n  Sharingan running at http://localhost:5000\n")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False, allow_unsafe_werkzeug=True)
+    print(f"\n  Sharingan running at http://{BIND_HOST}:5000  (bind={BIND_HOST})\n")
+    socketio.run(app, host=BIND_HOST, port=5000, debug=False, allow_unsafe_werkzeug=True)
