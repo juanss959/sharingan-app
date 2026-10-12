@@ -830,11 +830,14 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
 
 # ── Standalone OSINT ──
 
-def run_osint(domain):
+def run_osint(domain, sid=None):
+    def _se(ev, d):
+        socketio.emit(ev, d, room=sid)
+
     results = {"emails": [], "social": [], "meta": [], "wayback": [], "wayback_total": 0,
                "gdorks": [], "gitdorks": [], "gh_repos": [], "gh_code": [], "gh_gists": []}
 
-    socketio.emit("osint_status", {"status": "running", "msg": "Descargando pagina..."})
+    _se("osint_status", {"status": "running", "msg": "Descargando pagina..."})
 
     # Fetch HTML
     html_out = ""
@@ -851,7 +854,7 @@ def run_osint(domain):
 
     # 1. Email Harvesting
     if html_out:
-        socketio.emit("osint_status", {"status": "running", "msg": "Extrayendo emails..."})
+        _se("osint_status", {"status": "running", "msg": "Extrayendo emails..."})
         email_pattern = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
         raw_emails = set(re.findall(email_pattern, html_out))
         skip_ext = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.css', '.js', '.woff', '.ttf', '.ico'}
@@ -862,7 +865,7 @@ def run_osint(domain):
 
     # 2. Metadata
     if html_out:
-        socketio.emit("osint_status", {"status": "running", "msg": "Extrayendo metadata..."})
+        _se("osint_status", {"status": "running", "msg": "Extrayendo metadata..."})
         meta_patterns = {
             "Meta Description": r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
             "Meta Author": r'<meta\s+name=["\']author["\']\s+content=["\']([^"\']+)["\']',
@@ -896,7 +899,7 @@ def run_osint(domain):
                     results["social"].append({"platform": name, "url": u})
 
     # 3. Wayback Machine
-    socketio.emit("osint_status", {"status": "running", "msg": "Consultando Wayback Machine..."})
+    _se("osint_status", {"status": "running", "msg": "Consultando Wayback Machine..."})
     try:
         wb_url = f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&limit=50&fl=timestamp,original,statuscode&collapse=urlkey"
         wb_resp = requests.get(wb_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -933,7 +936,7 @@ def run_osint(domain):
         pass
 
     # 4a. Repos mentioning the domain
-    socketio.emit("osint_status", {"status": "running", "msg": "Buscando repositorios en GitHub..."})
+    _se("osint_status", {"status": "running", "msg": "Buscando repositorios en GitHub..."})
     try:
         gh_resp = requests.get(
             f"https://api.github.com/search/repositories?q={requests.utils.quote(domain)}&sort=updated&per_page=15",
@@ -954,7 +957,7 @@ def run_osint(domain):
         pass
 
     # 4b. Code search for secrets
-    socketio.emit("osint_status", {"status": "running", "msg": "Buscando secretos en codigo..."})
+    _se("osint_status", {"status": "running", "msg": "Buscando secretos en codigo..."})
     secret_queries = [
         ("API Keys / Tokens", f'"{domain}" password OR api_key OR apikey OR secret OR token OR bearer'),
         ("Config Files", f'"{domain}" filename:.env OR filename:.yml OR filename:.config OR filename:.ini'),
@@ -994,7 +997,7 @@ def run_osint(domain):
             pass
 
     # 4c. Gists mentioning the domain
-    socketio.emit("osint_status", {"status": "running", "msg": "Buscando en GitHub Gists..."})
+    _se("osint_status", {"status": "running", "msg": "Buscando en GitHub Gists..."})
     try:
         gist_resp = requests.get(
             f"https://api.github.com/search/code?q={requests.utils.quote(domain)}+in:file+language:text&per_page=10",
@@ -1012,7 +1015,7 @@ def run_osint(domain):
         pass
 
     # 5. Google Dorks
-    socketio.emit("osint_status", {"status": "running", "msg": "Generando Google Dorks..."})
+    _se("osint_status", {"status": "running", "msg": "Generando Google Dorks..."})
     dorks = [
         ("Archivos Sensibles", f'site:{domain} (filetype:pdf OR filetype:doc OR filetype:xls OR filetype:sql OR filetype:env OR filetype:log OR filetype:bak)'),
         ("Paginas de Login", f'site:{domain} (inurl:login OR inurl:signin OR inurl:auth OR inurl:admin)'),
@@ -1049,8 +1052,8 @@ def run_osint(domain):
         gh_url = f"https://github.com/search?q={requests.utils.quote(query)}&type=code"
         results["gitdorks"].append({"name": name, "query": query, "link": gh_url})
 
-    socketio.emit("osint_result", results)
-    socketio.emit("osint_status", {"status": "done", "msg": "OSINT completado"})
+    _se("osint_result", results)
+    _se("osint_status", {"status": "done", "msg": "OSINT completado"})
 
 
 @socketio.on("start_osint")
@@ -1058,7 +1061,7 @@ def handle_osint(data):
     domain = data.get("domain", "").strip()
     if not domain:
         return
-    threading.Thread(target=run_osint, args=(domain,), daemon=True).start()
+    threading.Thread(target=run_osint, args=(domain,), kwargs={"sid": request.sid}, daemon=True).start()
 
 
 # ── User OSINT (username / email lookup) ──
@@ -1538,7 +1541,10 @@ def _check_platform(platform, username, results_list, session):
         pass
 
 
-def run_user_osint(query, mode):
+def run_user_osint(query, mode, sid=None):
+    def _se(ev, d):
+        socketio.emit(ev, d, room=sid)
+
     results = {"query": query, "mode": mode, "found": [], "breaches": [], "emails_from_username": [],
                "dorks": [], "total_checked": 0}
 
@@ -1546,7 +1552,7 @@ def run_user_osint(query, mode):
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
     if mode == "username":
-        socketio.emit("user_osint_status", {"status": "running", "msg": f"Buscando '{query}' en {len(PLATFORM_CHECKS)} plataformas..."})
+        _se("user_osint_status", {"status": "running", "msg": f"Buscando '{query}' en {len(PLATFORM_CHECKS)} plataformas..."})
 
         threads = []
         found_list = []
@@ -1558,7 +1564,7 @@ def run_user_osint(query, mode):
         for i, t in enumerate(threads):
             t.join(timeout=12)
             if (i + 1) % 10 == 0 or i == len(threads) - 1:
-                socketio.emit("user_osint_status", {
+                _se("user_osint_status", {
                     "status": "running",
                     "msg": f"Verificadas {i + 1}/{len(PLATFORM_CHECKS)} plataformas... ({len(found_list)} encontradas)"
                 })
@@ -1566,7 +1572,7 @@ def run_user_osint(query, mode):
         results["found"] = sorted(found_list, key=lambda x: x["platform"])
         results["total_checked"] = len(PLATFORM_CHECKS)
 
-        socketio.emit("user_osint_status", {"status": "running", "msg": "Generando dorks de usuario..."})
+        _se("user_osint_status", {"status": "running", "msg": "Generando dorks de usuario..."})
         user_dorks = [
             ("Email en Google", f'"{query}" "@gmail.com" OR "@hotmail.com" OR "@yahoo.com" OR "@outlook.com"'),
             ("Perfiles publicos", f'"{query}" site:linkedin.com OR site:facebook.com OR site:twitter.com OR site:instagram.com'),
@@ -1581,12 +1587,12 @@ def run_user_osint(query, mode):
             results["dorks"].append({"name": name, "query": q, "link": f"https://www.google.com/search?q={requests.utils.quote(q)}"})
 
     elif mode == "email":
-        socketio.emit("user_osint_status", {"status": "running", "msg": f"Analizando email: {query}"})
+        _se("user_osint_status", {"status": "running", "msg": f"Analizando email: {query}"})
 
         email_local = query.split("@")[0] if "@" in query else query
         email_domain = query.split("@")[1] if "@" in query else ""
 
-        socketio.emit("user_osint_status", {"status": "running", "msg": f"Verificando email en {len(EMAIL_PLATFORM_CHECKS)} servicios..."})
+        _se("user_osint_status", {"status": "running", "msg": f"Verificando email en {len(EMAIL_PLATFORM_CHECKS)} servicios..."})
         threads = []
         found_list = []
         for plat in EMAIL_PLATFORM_CHECKS:
@@ -1596,14 +1602,14 @@ def run_user_osint(query, mode):
         for i, t in enumerate(threads):
             t.join(timeout=15)
             if (i + 1) % 8 == 0 or i == len(threads) - 1:
-                socketio.emit("user_osint_status", {
+                _se("user_osint_status", {
                     "status": "running",
                     "msg": f"Verificados {i + 1}/{len(EMAIL_PLATFORM_CHECKS)} servicios... ({len(found_list)} con cuenta)"
                 })
         results["found"] = sorted(found_list, key=lambda x: x["platform"])
         results["total_checked"] = len(EMAIL_PLATFORM_CHECKS)
 
-        socketio.emit("user_osint_status", {"status": "running", "msg": "Buscando breaches conocidos..."})
+        _se("user_osint_status", {"status": "running", "msg": "Buscando breaches conocidos..."})
         try:
             hibp_resp = session.get(f"https://haveibeenpwned.com/unifiedsearch/{query}", timeout=10,
                                     headers={"User-Agent": "Sharingan-OSINT"})
@@ -1623,7 +1629,7 @@ def run_user_osint(query, mode):
         except Exception:
             pass
 
-        socketio.emit("user_osint_status", {"status": "running", "msg": "Generando dorks de email..."})
+        _se("user_osint_status", {"status": "running", "msg": "Generando dorks de email..."})
         email_dorks = [
             ("Menciones del email", f'"{query}"'),
             ("Registros publicos", f'"{query}" site:linkedin.com OR site:facebook.com'),
@@ -1639,8 +1645,8 @@ def run_user_osint(query, mode):
         for name, q in email_dorks:
             results["dorks"].append({"name": name, "query": q, "link": f"https://www.google.com/search?q={requests.utils.quote(q)}"})
 
-    socketio.emit("user_osint_result", results)
-    socketio.emit("user_osint_status", {"status": "done", "msg": "Busqueda completada"})
+    _se("user_osint_result", results)
+    _se("user_osint_status", {"status": "done", "msg": "Busqueda completada"})
 
 
 @socketio.on("start_user_osint")
@@ -1649,7 +1655,7 @@ def handle_user_osint(data):
     mode = data.get("mode", "username")
     if not query:
         return
-    threading.Thread(target=run_user_osint, args=(query, mode), daemon=True).start()
+    threading.Thread(target=run_user_osint, args=(query, mode), kwargs={"sid": request.sid}, daemon=True).start()
 
 
 # ── Standalone Fuzzing ──
@@ -2144,7 +2150,7 @@ def _build_native_paths(wordlist_path, extensions, extra_words, max_paths):
 
 def run_fuzzing(url, extensions, threads, wordlist_path,
                 scan_id=None, phase=None, headers=None, max_depth=1,
-                emit_live=True, db=None):
+                emit_live=True, db=None, sid=None):
     import random as _random, string as _string, shutil as _shutil, threading as _threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2154,8 +2160,9 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
 
     def emit(ev, payload):
         # En FASE 6 (emit_live=False) no inundamos el panel standalone.
+        # room=sid: solo al cliente que lanzó el fuzz (evita cross-client bleed).
         if emit_live:
-            socketio.emit(ev, payload)
+            socketio.emit(ev, payload, room=sid)
 
     sid = _threading.get_ident()
     active_fuzz[sid] = "running"
@@ -2513,8 +2520,11 @@ BYPASS_TECHNIQUES = [
 ]
 
 
-def run_403_bypass(url, headers=None):
-    socketio.emit("bypass_status", {"status": "running", "msg": "Iniciando 403 bypass..."})
+def run_403_bypass(url, headers=None, sid=None):
+    def _se(ev, d):
+        socketio.emit(ev, d, room=sid)
+
+    _se("bypass_status", {"status": "running", "msg": "Iniciando 403 bypass..."})
     results = []
     total = len(BYPASS_TECHNIQUES)
     session = requests.Session()
@@ -2546,14 +2556,14 @@ def run_403_bypass(url, headers=None):
     except Exception:
         pass
 
-    socketio.emit("bypass_status", {
+    _se("bypass_status", {
         "status": "running",
         "msg": f"Status original: {original_status} | Probando {total} tecnicas..."
     })
 
     for i, tech in enumerate(BYPASS_TECHNIQUES):
         if (i + 1) % 5 == 0:
-            socketio.emit("bypass_status", {
+            _se("bypass_status", {
                 "status": "running",
                 "msg": f"Probando {i + 1}/{total}: {tech['name']}..."
             })
@@ -2632,7 +2642,7 @@ def run_403_bypass(url, headers=None):
                 "diff_length": length - original_length if original_length else 0,
             }
             results.append(entry)
-            socketio.emit("bypass_hit", entry)
+            _se("bypass_hit", entry)
 
         except Exception:
             results.append({
@@ -2646,7 +2656,7 @@ def run_403_bypass(url, headers=None):
             })
 
     bypassed_count = sum(1 for r in results if r.get("bypassed"))
-    socketio.emit("bypass_result", {
+    _se("bypass_result", {
         "url": url,
         "original_status": original_status,
         "original_length": original_length,
@@ -2654,7 +2664,7 @@ def run_403_bypass(url, headers=None):
         "total": total,
         "bypassed": bypassed_count,
     })
-    socketio.emit("bypass_status", {
+    _se("bypass_status", {
         "status": "done",
         "msg": f"Completado: {bypassed_count}/{total} tecnicas lograron bypass"
     })
@@ -2693,7 +2703,7 @@ def handle_bypass(data):
         socketio.emit("bypass_status", {"status": "done", "msg": f"Objetivo bloqueado: {msg}"})
         return
     headers = _parse_headers(data)
-    threading.Thread(target=run_403_bypass, args=(url,), kwargs={"headers": headers}, daemon=True).start()
+    threading.Thread(target=run_403_bypass, args=(url,), kwargs={"headers": headers, "sid": request.sid}, daemon=True).start()
 
 
 @socketio.on("start_fuzzing")
@@ -2738,7 +2748,7 @@ def handle_fuzzing(data):
 
     threading.Thread(
         target=run_fuzzing, args=(url, extensions, threads, wordlist),
-        kwargs={"scan_id": scan_id, "headers": headers, "max_depth": max_depth},
+        kwargs={"scan_id": scan_id, "headers": headers, "max_depth": max_depth, "sid": request.sid},
         daemon=True).start()
 
 
@@ -2808,14 +2818,17 @@ def _verify_url_python(url, session, headers=None):
         return None
 
 
-def run_httpx_verify(urls, headers=None):
+def run_httpx_verify(urls, headers=None, sid=None):
+    def _se(ev, d):
+        socketio.emit(ev, d, room=sid)
+
     enriched = []
     tmpdir = None
     try:
         use_httpx = _httpx_available()
 
         if use_httpx:
-            socketio.emit("httpx_status", {"status": "running", "msg": f"Verificando {len(urls)} URLs con httpx..."})
+            _se("httpx_status", {"status": "running", "msg": f"Verificando {len(urls)} URLs con httpx..."})
             tmpdir = Path(tempfile.mkdtemp(prefix="sharingan-httpx-"))
             in_file = tmpdir / "urls.txt"
             out_file = tmpdir / "httpx.json"
@@ -2852,7 +2865,7 @@ def run_httpx_verify(urls, headers=None):
                         continue
         else:
             # Fallback Python (httpx bloqueado por Device Guard o no disponible)
-            socketio.emit("httpx_status", {
+            _se("httpx_status", {
                 "status": "running",
                 "msg": f"httpx no disponible (bloqueado) - verificando {len(urls)} URLs con Python..."
             })
@@ -2871,7 +2884,7 @@ def run_httpx_verify(urls, headers=None):
                 for fut in as_completed(futures):
                     done += 1
                     if done % 25 == 0:
-                        socketio.emit("httpx_status", {
+                        _se("httpx_status", {
                             "status": "running",
                             "msg": f"Verificadas {done}/{len(urls)} URLs..."
                         })
@@ -2900,17 +2913,17 @@ def run_httpx_verify(urls, headers=None):
         enriched.sort(key=lambda x: (not x["likely_real"], x["status"], x["path"]))
         real_n = sum(1 for e in enriched if e["likely_real"])
 
-        socketio.emit("httpx_result", {
+        _se("httpx_result", {
             "results": enriched,
             "total": len(enriched),
             "real": real_n,
         })
-        socketio.emit("httpx_status", {
+        _se("httpx_status", {
             "status": "done",
             "msg": f"Verificacion completa: {len(enriched)} verificadas, {real_n} probablemente reales"
         })
     except Exception as e:
-        socketio.emit("httpx_status", {"status": "done", "msg": f"Error en verificacion: {e}"})
+        _se("httpx_status", {"status": "done", "msg": f"Error en verificacion: {e}"})
     finally:
         if tmpdir:
             import shutil
@@ -2935,7 +2948,7 @@ def handle_httpx_verify(data):
         socketio.emit("httpx_status", {"status": "done", "msg": "No hay URLs válidas para verificar (todas bloqueadas por el filtro SSRF)"})
         return
     headers = _parse_headers(data)
-    threading.Thread(target=run_httpx_verify, args=(urls,), kwargs={"headers": headers}, daemon=True).start()
+    threading.Thread(target=run_httpx_verify, args=(urls,), kwargs={"headers": headers, "sid": request.sid}, daemon=True).start()
 
 
 def update_scan(scan_id, **kwargs):
