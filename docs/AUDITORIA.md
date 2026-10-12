@@ -10,7 +10,12 @@
 - ✅ **P1 #9 (dedup de nuclei) — IMPLEMENTADO Y VERIFICADO** (2026-10-12): dedup de filas existentes + índice único `(scan_id, template, host, matched_at)` + `INSERT OR IGNORE`. **Con esto P1 queda 100% completo.** Verificado: dup exacto borrado, `matched_at` distinto conservado (sin sobre-dedup), reinserción ignorada.
 - ✅ **P2 — modelo assets↔findings correlacionado — IMPLEMENTADO Y VERIFICADO** (2026-10-12): tabla `assets` + vista `findings` + función SQL `norm_host` + `rebuild_assets` idempotente + endpoint `/api/scans/<id>/assets` + vista UI "Activos". Unifica las 4 representaciones de host y correlaciona vuln↔puerto↔dir por host canónico, con flag CDN (IP compartida). Ver §10.
 - ✅ **P2 — reportes exportables — IMPLEMENTADO Y VERIFICADO** (2026-10-12): endpoint `/api/scans/<id>/report` + vista UI "Informe" (imprimible) con separación **verificado/observación** + superficie de ataque + recomendaciones; export **PDF (print) / JSON / CSV**. Sin cambios de esquema.
-- Pendiente de aprobación: resto de **P2** (proyectos/alcance autorizado, workflows/plantillas, fix cross-client bleed) y **P3** (IA, feroxbuster/katana).
+- ✅ **P2 — fix cross-client bleed**: eventos socket de las tools standalone scopeados por `room=sid`.
+- ✅ **P2 — workflows/plantillas**: checkboxes de fase + plantillas (built-in + custom en localStorage) en el launcher.
+- ✅ **P2 — proyectos + alcance autorizado — IMPLEMENTADO Y VERIFICADO**: tabla `projects` + `scans.project_id` + gate `_assert_in_scope` (autorización, fail-closed) en los 4 handlers + CRUD + selector/modal/módulo UI + pre-check cliente. Diseñado y verificado por workflow.
+- ✅ **P3 — copiloto IA read-only**: endpoint `/api/ai/explain` con guardrails (solo-lectura, hallazgo como dato no confiable, sin explotación) + botón "🤖 Explicar"; requiere `SHARINGAN_ANTHROPIC_KEY`.
+- ✅ **P3 — feroxbuster + katana**: feroxbuster como motor alternativo de descubrimiento; katana como fuente de URLs (crawl activo) en FASE 7.
+- **ROADMAP COMPLETO: P0 + P1 + P2 + P3 implementados y verificados.**
 - También se corrigieron 2 defectos del refactor de fuzzing de esta sesión (§10).
 
 ---
