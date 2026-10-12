@@ -8,7 +8,8 @@
 - ✅ **P1 #5 (motor de validación central) + #6 (http_probe compartido) — IMPLEMENTADO Y VERIFICADO** (2026-10-12). Ver §10.
 - ✅ **P1 #7 (wildcard DNS + resolución + scope anclado + gate SSRF en FASE 3/4) + #8 (cancelación real de subprocesos + estado de error visible + reconciliación de scans) — IMPLEMENTADO Y VERIFICADO** (2026-10-12). Ver §10.
 - ✅ **P1 #9 (dedup de nuclei) — IMPLEMENTADO Y VERIFICADO** (2026-10-12): dedup de filas existentes + índice único `(scan_id, template, host, matched_at)` + `INSERT OR IGNORE`. **Con esto P1 queda 100% completo.** Verificado: dup exacto borrado, `matched_at` distinto conservado (sin sobre-dedup), reinserción ignorada.
-- Pendiente de aprobación: todo **P2** (assets↔findings, proyectos/alcance, workflows, reportes, fix cross-client) y **P3** (IA, feroxbuster/katana).
+- ✅ **P2 — modelo assets↔findings correlacionado — IMPLEMENTADO Y VERIFICADO** (2026-10-12): tabla `assets` + vista `findings` + función SQL `norm_host` + `rebuild_assets` idempotente + endpoint `/api/scans/<id>/assets` + vista UI "Activos". Unifica las 4 representaciones de host y correlaciona vuln↔puerto↔dir por host canónico, con flag CDN (IP compartida). Ver §10.
+- Pendiente de aprobación: resto de **P2** (proyectos/alcance, workflows, reportes, fix cross-client) y **P3** (IA, feroxbuster/katana).
 - También se corrigieron 2 defectos del refactor de fuzzing de esta sesión (§10).
 
 ---
@@ -249,5 +250,15 @@ Motor de validación central con taxonomía **verificado / probable / falso-posi
 
 **Verificación:** `_in_scope` (5/5 casos), resolución/NXDOMAIN, `_ips_internal` (loopback/privadas→True), wildcard (sin wildcard→vacío) ✓; `run_argv_cancel` probado en los 4 estados — **ok**, **error** (binario inexistente), **timeout** (ping 15s/to=2 → matado en 2.2s), **cancelled** (cancel a los 2s → matado en 2.1s) ✓; UI subs renderiza los 4 flags ✓.
 
+### ✅ P2 — modelo assets↔findings — IMPLEMENTADO Y VERIFICADO (2026-10-12)
+La columna vertebral de la plataforma. Diseñado + verificado adversarialmente por workflow, implementado y probado end-to-end:
+- **`_norm_host` + función SQL `norm_host`** (registrada en `get_db`): única normalización que colapsa las 4 representaciones de host (`alive_hosts.url`, `ports.host`, `vulns.host`, `directories.host`) a un host canónico.
+- **Tabla `assets`** (una fila por host/scan, clave `(scan_id, canonical_host)`) con IP, metadatos de httpx y flags wildcard/internal/shared_ip.
+- **Vista `findings`** (UNION ALL de vulns + directories con host canónico + veredicto) — refleja cada insert al instante, sin backfill ni drift.
+- **`rebuild_assets`** idempotente (UPSERT con COALESCE, commit interno, shared_ip por IP comma-joined), enganchado en `init_db` (backfill histórico), fin de `run_scan` y fin del fuzz standalone. `delete_scan` ahora limpia `assets`.
+- **Endpoint `/api/scans/<id>/assets`** (aditivo, no toca `get_scan`) + **vista "Activos"** (master-detail: host → puertos + findings + veredicto + flag CDN).
+
+**Verificación:** un vuln con `host=https://api.example.com` y un dir con `host=api.example.com:443` se correlacionan al MISMO asset; shared_ip detecta IP compartida (CDN) incluso con IPs comma-joined; peor-veredicto propagado; migración backfillea 15 assets en la BD real; UI renderiza master-detail con flags CDN?/WILDCARD/INTERNO.
+
 ### Siguiente paso recomendado (pendiente de aprobación)
-Con P0 + el núcleo de P1 cerrados, lo natural es **P2**: modelo **assets↔findings** correlacionado (unir vuln ↔ puerto ↔ dir por IP) + **proyectos/alcance autorizado**, o bien **#9 (dedup de nuclei)** si preferís cerrar P1 del todo primero.
+Resto de **P2**: **proyectos + alcance autorizado** (agrupar scans, gate de scope) o **reportes** (export PDF/HTML/JSON por scan/asset), ambos construyen sobre el modelo de assets ya existente. Luego **P3** (copiloto IA read-only, feroxbuster/katana).

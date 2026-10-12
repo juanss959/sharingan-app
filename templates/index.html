@@ -227,6 +227,9 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div class="nav-item disabled" data-mod="urls" onclick="showModule('urls')">
         <span class="icon">🔗</span><span class="label">URLs</span><span class="badge">0</span>
       </div>
+      <div class="nav-item disabled" data-mod="assets" onclick="showModule('assets')">
+        <span class="icon">🧩</span><span class="label">Activos</span><span class="badge">0</span>
+      </div>
       <div class="sidebar-divider"></div>
       <div class="nav-item disabled" data-mod="js_secrets" onclick="showModule('js_secrets')">
         <span class="icon">🔑</span><span class="label">JS Secrets</span><span class="badge">0</span>
@@ -286,6 +289,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
       <div id="view-vulns" style="display:none"></div>
       <div id="view-dirs" style="display:none"></div>
       <div id="view-urls" style="display:none"></div>
+      <div id="view-assets" style="display:none"></div>
       <div id="view-js_secrets" style="display:none"></div>
       <div id="view-fuzzing" style="display:none"></div>
       <div id="view-bypass403" style="display:none"></div>
@@ -380,6 +384,12 @@ function showModule(mod) {
   const domainH = `<span class="domain-tag">${esc(scan.domain)}</span>`;
   const statusH = `<span class="status ${scan.status}">${scan.status}</span>`;
 
+  if (mod === 'assets') {
+    setHeader('🧩 Activos', statusH);
+    document.getElementById('view-assets').style.display = '';
+    loadAssets(currentScanId);
+    return;
+  }
   if (mod === 'overview') {
     setHeader(domainH, statusH);
     renderOverview(scan);
@@ -388,6 +398,76 @@ function showModule(mod) {
     setHeader(titles[mod] || mod, statusH);
   }
   document.getElementById('view-' + mod).style.display = '';
+}
+
+async function loadAssets(scanId) {
+  const el = document.getElementById('view-assets');
+  el.innerHTML = '<div style="color:var(--text3);padding:12px">Cargando activos correlacionados...</div>';
+  try {
+    const res = await fetch(`/api/scans/${scanId}/assets`);
+    const data = await res.json();
+    renderAssetsView(data.assets || []);
+  } catch (e) {
+    el.innerHTML = '<div class="empty-state"><h3>Error</h3><p>No se pudieron cargar los activos.</p></div>';
+  }
+}
+
+function renderAssetsView(assets) {
+  const el = document.getElementById('view-assets');
+  if (!assets.length) {
+    el.innerHTML = '<div class="empty-state"><h3>Sin activos</h3><p>Aún no hay hosts correlacionados para este scan.</p></div>';
+    return;
+  }
+  const verifiedN = assets.filter(a => a.verdict === 'verified').length;
+  let html = `<div class="section-title"><span class="icon">🧩</span>Activos correlacionados (${assets.length})</div>
+    <div style="color:var(--text3);font-size:.74rem;margin-bottom:10px">Cada host unifica subdominios, hosts vivos, puertos, vulns y directorios por host canónico. ${verifiedN} con hallazgo verificado.</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Veredicto</th><th>Host</th><th>IP</th><th>Puertos</th><th>Findings</th><th>Flags</th></tr></thead><tbody>`;
+  assets.forEach((a, i) => {
+    const flags = [];
+    if (a.shared_ip) flags.push('<span title="IP compartida con otro host (posible CDN)" style="background:var(--purple);color:#fff;padding:1px 6px;border-radius:4px;font-size:.62rem">CDN?</span>');
+    if (a.is_wildcard) flags.push('<span style="background:#c62828;color:#fff;padding:1px 6px;border-radius:4px;font-size:.62rem">WILDCARD</span>');
+    if (a.is_internal) flags.push('<span style="background:var(--orange);color:#000;padding:1px 6px;border-radius:4px;font-size:.62rem">INTERNO</span>');
+    html += `<tr style="cursor:pointer" onclick="toggleAssetDetail(${i})">
+      <td>${validationBadge(a.verdict || 'probable', '')}</td>
+      <td style="font-family:monospace;font-size:.8rem;color:var(--accent)">${esc(a.canonical_host)}</td>
+      <td style="font-size:.74rem;color:var(--text2)">${esc(a.ip || '-')}</td>
+      <td style="font-size:.78rem">${(a.ports||[]).length}</td>
+      <td style="font-size:.78rem">${(a.findings||[]).length}</td>
+      <td>${flags.join(' ') || '-'}</td>
+    </tr>
+    <tr id="asset-detail-${i}" style="display:none"><td colspan="6">${renderAssetDetail(a)}</td></tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+  window._assetsData = assets;
+}
+
+function renderAssetDetail(a) {
+  let h = `<div style="padding:8px 4px;background:var(--bg2);border-radius:8px;margin:4px 0">`;
+  if (a.url) h += `<div style="font-size:.76rem;margin-bottom:6px"><a href="${esc(a.url)}" target="_blank" style="color:var(--accent)">${esc(a.url)}</a> ${a.server?('· '+esc(a.server)):''} ${a.tech?('· '+esc(a.tech)):''}</div>`;
+  if ((a.ports||[]).length) {
+    h += `<div style="font-size:.72rem;color:var(--text2);margin:4px 0">Puertos: ${a.ports.map(p=>`<span style="font-family:monospace">${p.port}/${esc(p.service||'')}</span>`).join(', ')}</div>`;
+  }
+  if ((a.findings||[]).length) {
+    h += `<table class="data-table" style="margin-top:4px"><thead><tr><th>Validación</th><th>Tipo</th><th>Hallazgo</th><th>Ubicación</th></tr></thead><tbody>`;
+    a.findings.forEach(f => {
+      h += `<tr>
+        <td>${validationBadge(f.validation_status, '')}</td>
+        <td style="font-size:.72rem">${esc(f.finding_type)}</td>
+        <td style="font-size:.76rem;color:var(--accent)">${esc(f.name||'')}</td>
+        <td style="font-size:.72rem;color:var(--text3);word-break:break-all">${esc(f.location||'')}</td>
+      </tr>`;
+    });
+    h += `</tbody></table>`;
+  } else {
+    h += `<div style="font-size:.72rem;color:var(--text3)">Sin vulns/directorios correlacionados.</div>`;
+  }
+  return h + `</div>`;
+}
+
+function toggleAssetDetail(i) {
+  const r = document.getElementById('asset-detail-' + i);
+  if (r) r.style.display = r.style.display === 'none' ? '' : 'none';
 }
 
 // ── Start Scan ──

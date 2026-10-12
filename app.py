@@ -37,10 +37,35 @@ active_fuzz = {}
 
 # ── Database ──
 
+def _norm_host(s):
+    """Las 4 representaciones de host (alive_hosts.url completa, ports.host pelado,
+    vulns.host crudo de nuclei, directories.host netloc-con-puerto) → un host
+    canónico (minúsculas, sin esquema/userinfo/puerto/path, IPv6 sin corchetes,
+    sin punto final), o None para basura. Única normalización del codebase: es la
+    clave de correlación de assets/findings."""
+    if not s:
+        return None
+    from urllib.parse import urlparse as _up
+    s = str(s).strip().lower()
+    if not s:
+        return None
+    try:
+        u = _up(s if "://" in s else "//" + s)
+        h = u.hostname
+    except Exception:
+        h = None
+    if not h:
+        h = s.split("/", 1)[0].rsplit("@", 1)[-1].split(":", 1)[0]
+    h = (h or "").rstrip(".")
+    return h or None
+
+
 def get_db():
     db = sqlite3.connect(str(DB_PATH))
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    # norm_host disponible en SQL (vista findings, endpoint de assets).
+    db.create_function("norm_host", 1, _norm_host, deterministic=True)
     return db
 
 
@@ -130,6 +155,26 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_dirs_scan ON directories(scan_id);
         CREATE INDEX IF NOT EXISTS idx_urls_scan ON urls(scan_id);
         CREATE INDEX IF NOT EXISTS idx_recon_scan ON recon_info(scan_id);
+        CREATE TABLE IF NOT EXISTS assets (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id        INTEGER REFERENCES scans(id),
+            canonical_host TEXT NOT NULL,
+            ip             TEXT,
+            url            TEXT,
+            status_code    INTEGER,
+            title          TEXT,
+            tech           TEXT,
+            server         TEXT,
+            content_length INTEGER,
+            is_wildcard    INTEGER,
+            is_internal    INTEGER,
+            in_subdomains  INTEGER DEFAULT 0,
+            in_alive       INTEGER DEFAULT 0,
+            shared_ip      INTEGER DEFAULT 0,
+            created_at     TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_scan_host ON assets(scan_id, canonical_host);
+        CREATE INDEX IF NOT EXISTS idx_assets_scan ON assets(scan_id);
     """)
 
     # ── Migración idempotente para BDs ya existentes ──
@@ -172,8 +217,108 @@ def init_db():
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_vulns_unique
                   ON vulns(scan_id, template, host, matched_at)""")
 
+    # ── P2: capa de correlación assets ↔ findings ──
+    # findings es una VISTA (no tabla): UNION ALL de vulns + directories con el
+    # host canonicalizado y el veredicto ya calculado. Refleja cada insert al
+    # instante, sin doble-escritura ni backfill. Se crea DESPUÉS de _ensure_cols
+    # porque referencia validation_status/evidence (SQLite liga vistas de forma
+    # perezosa, pero un SELECT fallaría sin esas columnas).
+    db.execute("DROP VIEW IF EXISTS findings")
+    db.execute("""CREATE VIEW findings AS
+        SELECT v.scan_id AS scan_id, norm_host(v.host) AS canonical_host,
+               'vuln' AS finding_type, v.id AS source_id, v.template AS name,
+               v.severity AS severity, v.matched_at AS location,
+               v.validation_status AS validation_status, v.evidence AS evidence
+        FROM vulns v
+        UNION ALL
+        SELECT d.scan_id, norm_host(d.host), 'dir', d.id, d.path,
+               d.interest, d.redirect, d.validation_status, d.evidence
+        FROM directories d""")
+
+    # Backfill histórico de assets para todos los scans existentes (idempotente).
+    for (sid,) in db.execute("SELECT id FROM scans").fetchall():
+        try:
+            rebuild_assets(db, sid)
+        except Exception:
+            pass
+
     db.commit()
     db.close()
+
+
+def rebuild_assets(db, scan_id):
+    """Reconstruye los assets de un scan: unifica los hosts de las 5 tablas en
+    un host canónico (_norm_host), enriquece con la IP de subdomains (el puente)
+    y los metadatos de alive_hosts, y hace UPSERT idempotente. Marca shared_ip
+    (IP compartida por >1 host = posible CDN). Commitea internamente."""
+    db.create_function("norm_host", 1, _norm_host, deterministic=True)
+    hosts = set()
+    for col, tbl in [("subdomain", "subdomains"), ("url", "alive_hosts"),
+                     ("host", "ports"), ("host", "vulns"), ("host", "directories")]:
+        for r in db.execute(f"SELECT DISTINCT {col} AS v FROM {tbl} WHERE scan_id=?", (scan_id,)):
+            h = _norm_host(r["v"])
+            if h:
+                hosts.add(h)
+    if not hosts:
+        db.commit()
+        return
+
+    sub = {}
+    for r in db.execute("SELECT subdomain, ip, is_wildcard, is_internal FROM subdomains WHERE scan_id=? AND resolved=1", (scan_id,)):
+        h = _norm_host(r["subdomain"])
+        if h:
+            sub.setdefault(h, r)
+    alive = {}
+    for r in db.execute("SELECT url, status_code, title, tech, server, content_length FROM alive_hosts WHERE scan_id=?", (scan_id,)):
+        h = _norm_host(r["url"])
+        if h:
+            alive.setdefault(h, r)
+
+    now = datetime.now().isoformat()
+    for h in hosts:
+        s, a = sub.get(h), alive.get(h)
+        db.execute("""
+            INSERT INTO assets (scan_id, canonical_host, ip, url, status_code, title, tech,
+                server, content_length, is_wildcard, is_internal, in_subdomains, in_alive, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(scan_id, canonical_host) DO UPDATE SET
+                ip=COALESCE(excluded.ip, assets.ip),
+                url=COALESCE(excluded.url, assets.url),
+                status_code=COALESCE(excluded.status_code, assets.status_code),
+                title=COALESCE(excluded.title, assets.title),
+                tech=COALESCE(excluded.tech, assets.tech),
+                server=COALESCE(excluded.server, assets.server),
+                content_length=COALESCE(excluded.content_length, assets.content_length),
+                is_wildcard=COALESCE(excluded.is_wildcard, assets.is_wildcard),
+                is_internal=COALESCE(excluded.is_internal, assets.is_internal),
+                in_subdomains=MAX(excluded.in_subdomains, assets.in_subdomains),
+                in_alive=MAX(excluded.in_alive, assets.in_alive)
+        """, (scan_id, h,
+              s["ip"] if s else None,
+              a["url"] if a else None,
+              a["status_code"] if a else None,
+              a["title"] if a else None,
+              a["tech"] if a else None,
+              a["server"] if a else None,
+              a["content_length"] if a else None,
+              s["is_wildcard"] if s else None,
+              s["is_internal"] if s else None,
+              1 if s else 0, 1 if a else 0, now))
+
+    # shared_ip: IPs (comma-joined) vistas en más de un host.
+    ip_hosts = {}
+    for r in db.execute("SELECT canonical_host, ip FROM assets WHERE scan_id=?", (scan_id,)):
+        if not r["ip"]:
+            continue
+        for part in r["ip"].split(","):
+            ip = part.strip()
+            if ip:
+                ip_hosts.setdefault(ip, set()).add(r["canonical_host"])
+    shared = {h for hs in ip_hosts.values() if len(hs) > 1 for h in hs}
+    db.execute("UPDATE assets SET shared_ip=0 WHERE scan_id=?", (scan_id,))
+    for h in shared:
+        db.execute("UPDATE assets SET shared_ip=1 WHERE scan_id=? AND canonical_host=?", (scan_id, h))
+    db.commit()
 
 
 # ── Helpers ──
@@ -2302,6 +2447,11 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
                 pdb.execute("UPDATE scans SET status='done', finished_at=? WHERE id=?",
                             (datetime.now().isoformat(), scan_id))
             pdb.commit()
+            # P2: correlacionar los dirs recién persistidos en assets.
+            try:
+                rebuild_assets(pdb, scan_id)
+            except Exception:
+                pass
         except Exception:
             pass
         finally:
@@ -3156,6 +3306,13 @@ def run_scan(scan_id, domain, phases):
             socketio.emit("stats_update", {"scan_id": scan_id, "urls": total, "params": params, "files": files})
             socketio.emit("phase_status", {"scan_id": scan_id, "phase": 7, "status": "done"})
 
+        # P2: correlación assets ↔ findings (todas las representaciones de host
+        # recién están completas tras FASE 6; reconciliamos una vez al final).
+        try:
+            rebuild_assets(db, scan_id)
+        except Exception:
+            pass
+
         # Done
         update_scan(scan_id, status="completed", finished_at=datetime.now().isoformat(), current_phase=7)
         socketio.emit("scan_done", {"scan_id": scan_id})
@@ -3256,10 +3413,38 @@ def get_scan(scan_id):
     return jsonify(result)
 
 
+@app.route("/api/scans/<int:scan_id>/assets")
+def get_scan_assets(scan_id):
+    """Vista asset-centric: cada host con sus puertos + findings (vulns/dirs)
+    correlacionados + el peor veredicto. Endpoint NUEVO; no toca get_scan."""
+    db = get_db()
+    if not db.execute("SELECT 1 FROM scans WHERE id=?", (scan_id,)).fetchone():
+        db.close()
+        return jsonify({"error": "not found"}), 404
+    out = []
+    for a in db.execute("SELECT * FROM assets WHERE scan_id=? ORDER BY canonical_host", (scan_id,)).fetchall():
+        a = dict(a)
+        h = a["canonical_host"]
+        a["ports"] = [dict(r) for r in db.execute(
+            "SELECT port, state, service, version FROM ports WHERE scan_id=? AND norm_host(host)=? ORDER BY port",
+            (scan_id, h)).fetchall()]
+        a["findings"] = [dict(r) for r in db.execute(
+            """SELECT finding_type, name, severity, location, validation_status, evidence
+               FROM findings WHERE scan_id=? AND canonical_host=?""", (scan_id, h)).fetchall()]
+        v = db.execute(
+            """SELECT validation_status FROM findings WHERE scan_id=? AND canonical_host=?
+               ORDER BY CASE validation_status WHEN 'verified' THEN 0 WHEN 'probable' THEN 1
+                        WHEN 'inconclusive' THEN 2 ELSE 3 END LIMIT 1""", (scan_id, h)).fetchone()
+        a["verdict"] = v[0] if v else None
+        out.append(a)
+    db.close()
+    return jsonify({"scan_id": scan_id, "assets": out})
+
+
 @app.route("/api/scans/<int:scan_id>", methods=["DELETE"])
 def delete_scan(scan_id):
     db = get_db()
-    for table in ["subdomains", "alive_hosts", "ports", "vulns", "directories", "urls", "recon_info"]:
+    for table in ["subdomains", "alive_hosts", "ports", "vulns", "directories", "urls", "recon_info", "assets"]:
         db.execute(f"DELETE FROM {table} WHERE scan_id=?", (scan_id,))
     db.execute("DELETE FROM scans WHERE id=?", (scan_id,))
     db.commit()
