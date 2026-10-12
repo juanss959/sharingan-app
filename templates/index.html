@@ -2076,12 +2076,45 @@ async function deleteScan(id) {
 }
 
 // ── Tools ──
+const TOOL_INFO = {
+  subfinder:   { area: 'Subdominios',   desc: 'Enumeración pasiva de subdominios desde múltiples fuentes OSINT.' },
+  sublist3r:   { area: 'Subdominios',   desc: 'Enumeración de subdominios vía motores de búsqueda (Google, Bing, etc.).' },
+  assetfinder: { area: 'Subdominios',   desc: 'Descubre subdominios y assets relacionados al dominio.' },
+  httpx:       { area: 'Hosts vivos',   desc: 'Sondeo HTTP: detecta hosts vivos, status, título, tecnología y servidor.' },
+  nmap:        { area: 'Puertos',       desc: 'Escaneo de puertos y detección de servicios/versiones.' },
+  nuclei:      { area: 'Vulnerabilidades', desc: 'Escáner por templates: CVEs, exposiciones y malas configuraciones.' },
+  ffuf:        { area: 'Fuzzing',       desc: 'Fuzzing rápido de directorios y archivos (motor principal).' },
+  feroxbuster: { area: 'Fuzzing',       desc: 'Descubrimiento de contenido recursivo (motor alternativo de ffuf).' },
+  dirsearch:   { area: 'Directorios',   desc: 'Descubrimiento de directorios y archivos (fallback).' },
+  katana:      { area: 'URLs / crawl',  desc: 'Crawler: descubre endpoints y URLs navegando el sitio activamente.' },
+  waybackurls: { area: 'URLs',          desc: 'URLs históricas conocidas desde Wayback Machine.' },
+  gau:         { area: 'URLs',          desc: 'URLs históricas de varias fuentes (Wayback, OTX, CommonCrawl).' },
+  whois:       { area: 'Recon pasivo',  desc: 'Información de registro del dominio (registrar, fechas, NS).' },
+};
 async function loadTools() {
+  const el = document.getElementById('view-tools');
+  el.innerHTML = '<div class="section-title"><span class="icon">⚙</span>Herramientas</div><div style="color:var(--text3);font-size:.8rem;padding:10px">Verificando herramientas instaladas en el PATH...</div>';
   const res = await fetch('/api/tools');
   const tools = await res.json();
-  document.getElementById('view-tools').innerHTML = '<div class="tools-grid">' + Object.entries(tools).map(([name, ok]) =>
-    `<div class="tool-item"><div class="tool-dot ${ok?'ok':'fail'}"></div><span>${name}</span></div>`
-  ).join('') + '</div>';
+  const entries = Object.entries(tools);
+  const okCount = entries.filter(([,ok]) => ok).length;
+  let html = `<div class="section-title"><span class="icon">⚙</span>Herramientas</div>
+    <div style="color:var(--text3);font-size:.78rem;margin-bottom:12px">${okCount}/${entries.length} instaladas y detectadas en el PATH de la app.</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Estado</th><th>Herramienta</th><th>Área</th><th>Descripción</th></tr></thead><tbody>`;
+  html += entries.map(([name, ok]) => {
+    const info = TOOL_INFO[name] || { area: '', desc: '' };
+    const badge = ok
+      ? '<span style="background:var(--green);color:#000;padding:2px 9px;border-radius:5px;font-size:.66rem;font-weight:700;white-space:nowrap">INSTALADA</span>'
+      : '<span style="background:#c62828;color:#fff;padding:2px 9px;border-radius:5px;font-size:.66rem;font-weight:700;white-space:nowrap">FALTA</span>';
+    return `<tr style="${ok?'':'opacity:.6'}">
+      <td>${badge}</td>
+      <td style="font-family:monospace;font-size:.82rem;color:var(--accent);font-weight:600">${esc(name)}</td>
+      <td style="font-size:.74rem;color:var(--text2);white-space:nowrap">${esc(info.area)}</td>
+      <td style="font-size:.78rem;color:var(--text)">${esc(info.desc)}</td>
+    </tr>`;
+  }).join('');
+  html += '</tbody></table></div>';
+  document.getElementById('view-tools').innerHTML = html;
 }
 
 // ── Util ──
