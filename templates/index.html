@@ -195,6 +195,17 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
     <div class="sidebar-input">
       <input type="text" id="domain-input" placeholder="target.com" onkeydown="if(event.key==='Enter')startScan()">
       <button class="scan-btn" id="start-btn" onclick="startScan()">Iniciar Scan</button>
+      <details style="margin-top:8px">
+        <summary style="cursor:pointer;color:var(--text3);font-size:.68rem;text-transform:uppercase;letter-spacing:1px">Fases / Plantilla</summary>
+        <div style="margin-top:6px">
+          <select id="tpl-select" onchange="applyTemplate(this.value)" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text);font-size:.74rem;outline:none;margin-bottom:6px"></select>
+          <div id="phase-checks" style="display:flex;flex-direction:column;gap:3px;font-size:.72rem;color:var(--text2)"></div>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <input id="tpl-name" type="text" placeholder="Nombre plantilla" style="flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:4px 7px;color:var(--text);font-size:.7rem;outline:none">
+            <button onclick="saveTemplate()" style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.7rem;padding:4px 8px;cursor:pointer">Guardar</button>
+          </div>
+        </div>
+      </details>
     </div>
 
     <div class="sidebar-section">Resultados</div>
@@ -597,11 +608,57 @@ function exportReportCsv() {
 }
 
 // ── Start Scan ──
+// ── Fases / plantillas de workflow ──
+const PHASE_LABELS = {1:'Recon pasivo + DNS',2:'Subdominios',3:'Hosts vivos',4:'Puertos',5:'Vulnerabilidades',6:'Directorios',7:'URLs históricas'};
+const BUILTIN_TEMPLATES = {
+  'Completo (1-7)': [1,2,3,4,5,6,7],
+  'Recon pasivo': [1,2],
+  'Descubrimiento web': [1,2,3,6],
+  'Superficie + vulns': [1,2,3,4,5],
+};
+function userTemplates() {
+  try { return JSON.parse(localStorage.getItem('sharingan_templates') || '{}'); } catch(e) { return {}; }
+}
+function allTemplates() { return Object.assign({}, BUILTIN_TEMPLATES, userTemplates()); }
+function initPhasePanel() {
+  const checks = document.getElementById('phase-checks');
+  if (checks && !checks.children.length) {
+    checks.innerHTML = Object.entries(PHASE_LABELS).map(([n,l]) =>
+      `<label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="phase-ck" value="${n}" checked style="accent-color:var(--red)">${n}. ${l}</label>`).join('');
+  }
+  refreshTemplateSelect();
+}
+function refreshTemplateSelect() {
+  const sel = document.getElementById('tpl-select');
+  if (!sel) return;
+  const t = allTemplates();
+  sel.innerHTML = Object.keys(t).map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
+}
+function applyTemplate(name) {
+  const t = allTemplates()[name];
+  if (!t) return;
+  document.querySelectorAll('.phase-ck').forEach(c => c.checked = t.includes(parseInt(c.value)));
+}
+function saveTemplate() {
+  const name = (document.getElementById('tpl-name').value || '').trim();
+  if (!name) return;
+  const phases = selectedPhases();
+  const ut = userTemplates(); ut[name] = phases;
+  try { localStorage.setItem('sharingan_templates', JSON.stringify(ut)); } catch(e) {}
+  document.getElementById('tpl-name').value = '';
+  refreshTemplateSelect();
+}
+function selectedPhases() {
+  const p = [...document.querySelectorAll('.phase-ck:checked')].map(c => parseInt(c.value));
+  return p.length ? p : [1,2,3,4,5,6,7];
+}
+
 function startScan() {
   const domain = document.getElementById('domain-input').value.trim();
   if (!domain) return;
+  initPhasePanel();
   document.getElementById('start-btn').disabled = true;
-  socket.emit('start_scan', { domain, phases: [1,2,3,4,5,6,7] });
+  socket.emit('start_scan', { domain, phases: selectedPhases() });
 }
 
 socket.on('scan_started', data => {
@@ -1894,6 +1951,8 @@ function formatDate(s) {
     return d.toLocaleDateString('es') + ' ' + d.toLocaleTimeString('es', {hour:'2-digit',minute:'2-digit'});
   } catch(e) { return s; }
 }
+
+document.addEventListener('DOMContentLoaded', () => { try { initPhasePanel(); } catch(e) {} });
 </script>
 </body>
 </html>
