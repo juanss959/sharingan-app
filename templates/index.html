@@ -961,6 +961,27 @@ function renderOverview(scan) {
     html += '</div></div>';
   }
 
+  // Archivos, cookies, paths sensibles y formularios (recolectado en el scan, antes oculto)
+  const extraBlocks = [
+    ['📄 Archivos (robots / sitemap / security.txt)', info.files, 'var(--cyan)'],
+    ['🍪 Cookies', info.cookies, 'var(--yellow)'],
+    ['⚠️ Paths sensibles accesibles', info.paths, 'var(--red)'],
+    ['📝 Formularios (superficie de ataque)', info.forms, 'var(--purple)'],
+  ];
+  extraBlocks.forEach(([title, rows, color]) => {
+    if (rows && rows.length) {
+      html += `<div style="margin-bottom:16px"><h3 style="color:${color};margin-bottom:8px;font-size:.95rem">${title} <span style="color:var(--text3);font-weight:400">(${rows.length})</span></h3>`;
+      html += '<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;overflow:hidden">';
+      rows.forEach(r => {
+        html += `<div style="display:flex;padding:7px 12px;border-bottom:1px solid var(--border);gap:10px">
+          <span style="color:${color};font-size:.76rem;min-width:130px;font-weight:600;word-break:break-all">${esc(r.key)}</span>
+          <span style="color:var(--text1);font-size:.76rem;word-break:break-all;white-space:pre-wrap">${esc(r.value)}</span>
+        </div>`;
+      });
+      html += '</div></div>';
+    }
+  });
+
   document.getElementById('view-overview').innerHTML = html;
 }
 

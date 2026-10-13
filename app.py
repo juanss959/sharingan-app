@@ -668,7 +668,7 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
 
     # ── robots.txt ──
     base = f"{working_scheme or 'http'}://{domain}"
-    robots_out = run_argv(["curl", "-s", "--max-time", "10", f"{base}/robots.txt"])
+    robots_out = run_argv(["curl", "-s", "-L", "--max-time", "10", f"{base}/robots.txt"])
     if robots_out and 'user-agent' in robots_out.lower() and '<html' not in robots_out.lower():
         save_info(db, scan_id, "files", "robots.txt", robots_out.strip()[:2000])
         disallowed = re.findall(r'Disallow:\s*(.+)', robots_out, re.IGNORECASE)
@@ -679,10 +679,17 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
             save_info(db, scan_id, "files", "Sitemaps", "\n".join(s.strip() for s in sitemaps))
 
     # ── sitemap.xml ──
-    sitemap_out = run_argv(["curl", "-s", "--max-time", "10", f"{base}/sitemap.xml"])
+    sitemap_out = run_argv(["curl", "-s", "-L", "--max-time", "10", f"{base}/sitemap.xml"])
     if sitemap_out and '<?xml' in sitemap_out.lower():
         url_count = len(re.findall(r'<loc>', sitemap_out))
         save_info(db, scan_id, "files", "sitemap.xml", f"{url_count} URLs encontradas")
+
+    # ── security.txt (/.well-known/security.txt) ──
+    for sec_path in ["/.well-known/security.txt", "/security.txt"]:
+        st_out = run_argv(["curl", "-s", "-L", "--max-time", "10", f"{base}{sec_path}"])
+        if st_out and ('contact:' in st_out.lower() or 'policy:' in st_out.lower()) and '<html' not in st_out.lower():
+            save_info(db, scan_id, "files", "security.txt", st_out.strip()[:1500])
+            break
 
     # ── Tech detection from HTML ──
     html_out = run_argv(["curl", "-s", "--max-time", "10", "-L", base])
@@ -727,8 +734,32 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
     for path in sensitive_paths:
         out = run_argv(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", f"{base}{path}"])
         code = out.strip()
-        if code and code not in ["000", "404", "403", "0"]:
+        if code and code not in ["000", "404", "403", "0", "301", "302", "307", "308"]:
             save_info(db, scan_id, "paths", path, f"HTTP {code}")
+
+    # ── Formularios (action, metodo, campos = superficie de inyeccion/CSRF) ──
+    if html_out:
+        form_tags = re.findall(r'<form\b[^>]*>', html_out, re.IGNORECASE)
+        form_bodies = re.findall(r'<form\b[^>]*>(.*?)</form>', html_out, re.IGNORECASE | re.DOTALL)
+        for i, ftag in enumerate(form_tags, 1):
+            fbody = form_bodies[i - 1] if i - 1 < len(form_bodies) else ""
+            action_m = re.search(r'action\s*=\s*["\']([^"\']*)["\']', ftag, re.IGNORECASE)
+            method_m = re.search(r'method\s*=\s*["\']([^"\']*)["\']', ftag, re.IGNORECASE)
+            action = action_m.group(1).strip() if action_m else ""
+            method = (method_m.group(1).strip().upper() if method_m else "GET")
+            fields = re.findall(r'<(?:input|select|textarea)\b[^>]*\bname\s*=\s*["\']([^"\']+)["\']', fbody, re.IGNORECASE)
+            input_types = [t.lower() for t in re.findall(r'<input\b[^>]*\btype\s*=\s*["\']([^"\']+)["\']', fbody, re.IGNORECASE)]
+            flags = []
+            if 'password' in input_types:
+                flags.append("login/password")
+            if 'file' in input_types:
+                flags.append("subida de archivos")
+            if 'hidden' in input_types:
+                flags.append(f"{input_types.count('hidden')} hidden")
+            desc = f"{method} -> {action or '(misma pagina)'}  |  campos: {', '.join(fields) if fields else '(ninguno)'}"
+            if flags:
+                desc += "  |  " + ", ".join(flags)
+            save_info(db, scan_id, "forms", f"Form #{i}", desc)
 
     # ── JS Secrets Analysis ──
     if html_out:
@@ -780,6 +811,11 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
             "Internal Endpoint": r'https?://(?:api\.|internal\.|staging\.|dev\.|admin\.|test\.)[a-zA-Z0-9.-]+\.[a-z]{2,}(?:/[a-zA-Z0-9/._-]*)?',
             "Hardcoded Private IP": r'(?<![0-9])(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})(?::\d{2,5})(?![0-9])',
             "MapBox Token": r'pk\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+',
+            "Supabase URL": r'https?://[a-z0-9]{15,25}\.supabase\.co',
+            "Supabase Publishable Key": r'sb_publishable_[A-Za-z0-9_-]{20,}',
+            "Supabase Secret Key": r'sb_secret_[A-Za-z0-9_-]{20,}',
+            "NEXT_PUBLIC Var": r'NEXT_PUBLIC_[A-Z0-9_]+',
+            "Credencial por Defecto (?? )": r'(?:[A-Z_]*(?:PASSWORD|SECRET|API_KEY|TOKEN|ADMIN_EMAIL))\s*\?\?\s*["\']([^"\']{4,})["\']',
         }
         # ── Filtro anti-falsos-positivos (etiquetas UI / i18n / placeholders) ──
         FALSE_POSITIVE_VALUES = {
