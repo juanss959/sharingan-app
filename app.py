@@ -1093,9 +1093,7 @@ def run_osint(domain, sid=None):
     def _se(ev, d):
         socketio.emit(ev, d, room=sid)
 
-    results = {"emails": [], "social": [], "meta": [], "wayback": [], "wayback_total": 0,
-               "gdorks": [], "gitdorks": [], "gh_repos": [], "gh_code": [], "gh_gists": [],
-               "source_repo": {}}
+    results = {"source_repo": {}}
 
     _se("osint_status", {"status": "running", "msg": "Descargando pagina..."})
 
@@ -1114,80 +1112,7 @@ def run_osint(domain, sid=None):
         except Exception:
             continue
 
-    # 1. Email Harvesting
-    if html_out:
-        _se("osint_status", {"status": "running", "msg": "Extrayendo emails..."})
-        email_pattern = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-        raw_emails = set(re.findall(email_pattern, html_out))
-        skip_ext = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.css', '.js', '.woff', '.ttf', '.ico'}
-        for e in sorted(raw_emails):
-            el = e.lower()
-            if not any(el.endswith(ext) for ext in skip_ext) and '.' in el.split('@')[1]:
-                results["emails"].append(el)
-
-    # 2. Metadata
-    if html_out:
-        _se("osint_status", {"status": "running", "msg": "Extrayendo metadata..."})
-        meta_patterns = {
-            "Meta Description": r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
-            "Meta Author": r'<meta\s+name=["\']author["\']\s+content=["\']([^"\']+)["\']',
-            "Meta Generator": r'<meta\s+name=["\']generator["\']\s+content=["\']([^"\']+)["\']',
-            "OG Title": r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-            "OG Description": r'<meta\s+property=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
-            "OG Image": r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-            "OG Site Name": r'<meta\s+property=["\']og:site_name["\']\s+content=["\']([^"\']+)["\']',
-            "Twitter Handle": r'<meta\s+name=["\']twitter:(?:site|creator)["\']\s+content=["\'](@[^"\']+)["\']',
-        }
-        for name, pat in meta_patterns.items():
-            m = re.search(pat, html_out, re.IGNORECASE)
-            if m:
-                results["meta"].append({"key": name, "value": m.group(1).strip()})
-
-        # Social media links
-        social_patterns = {
-            "LinkedIn": r'https?://(?:www\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9\-_.%]+/?',
-            "Twitter/X": r'https?://(?:www\.)?(?:twitter\.com|x\.com)/[a-zA-Z0-9_]+/?',
-            "GitHub": r'https?://(?:www\.)?github\.com/[a-zA-Z0-9\-]+/?',
-            "Facebook": r'https?://(?:www\.)?facebook\.com/[a-zA-Z0-9.\-]+/?',
-            "Instagram": r'https?://(?:www\.)?instagram\.com/[a-zA-Z0-9_.]+/?',
-            "YouTube": r'https?://(?:www\.)?youtube\.com/(?:c/|channel/|@)[a-zA-Z0-9\-_]+/?',
-        }
-        found_social = set()
-        for name, pat in social_patterns.items():
-            for m in re.finditer(pat, html_out, re.IGNORECASE):
-                u = m.group(0).rstrip('/')
-                if u not in found_social:
-                    found_social.add(u)
-                    results["social"].append({"platform": name, "url": u})
-
-    # 3. Wayback Machine
-    _se("osint_status", {"status": "running", "msg": "Consultando Wayback Machine..."})
-    try:
-        wb_url = f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&limit=50&fl=timestamp,original,statuscode&collapse=urlkey"
-        wb_resp = requests.get(wb_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if wb_resp.status_code == 200:
-            wb_data = wb_resp.json()
-            results["wayback_total"] = len(wb_data) - 1 if len(wb_data) > 1 else 0
-            interesting_ext = {'.php', '.asp', '.aspx', '.jsp', '.env', '.bak', '.old', '.sql', '.xml',
-                               '.json', '.yml', '.yaml', '.conf', '.config', '.log', '.txt', '.zip',
-                               '.tar', '.gz', '.rar', '.csv', '.xls', '.doc', '.pdf', '.git'}
-            interesting_paths = {'admin', 'login', 'dashboard', 'api', 'backup', 'config', 'debug',
-                                 'test', 'staging', 'dev', 'internal', 'panel', 'console', 'upload',
-                                 'private', 'secret', 'wp-admin', 'phpmyadmin', '.env', '.git'}
-            wb_found = set()
-            for row in wb_data[1:]:
-                ts, url_orig = row[0], row[1]
-                url_lower = url_orig.lower()
-                is_interesting = any(url_lower.endswith(ext) for ext in interesting_ext)
-                is_interesting = is_interesting or any(p in url_lower for p in interesting_paths)
-                if is_interesting and url_orig not in wb_found and len(wb_found) < 30:
-                    wb_found.add(url_orig)
-                    wb_link = f"https://web.archive.org/web/{ts}/{url_orig}"
-                    results["wayback"].append({"url": url_orig, "link": wb_link})
-    except Exception:
-        pass
-
-    # 4. GitHub Recon (live API search)
+    # GitHub token (para la API)
     gh_headers = {"Accept": "application/vnd.github.v3+json", "User-Agent": "Sharingan-OSINT"}
     try:
         gh_cmd = str(SCOOP_SHIMS / "gh.exe") if (SCOOP_SHIMS / "gh.exe").exists() else "gh"
@@ -1197,87 +1122,7 @@ def run_osint(domain, sid=None):
     except Exception:
         pass
 
-    # 4a. Repos mentioning the domain
-    _se("osint_status", {"status": "running", "msg": "Buscando repositorios en GitHub..."})
-    try:
-        gh_resp = requests.get(
-            f"https://api.github.com/search/repositories?q={requests.utils.quote(domain)}&sort=updated&per_page=15",
-            headers=gh_headers, timeout=12)
-        if gh_resp.status_code == 200:
-            for repo in gh_resp.json().get("items", []):
-                results["gh_repos"].append({
-                    "name": repo.get("full_name", ""),
-                    "url": repo.get("html_url", ""),
-                    "description": (repo.get("description") or "")[:150],
-                    "stars": repo.get("stargazers_count", 0),
-                    "forks": repo.get("forks_count", 0),
-                    "language": repo.get("language") or "",
-                    "updated": (repo.get("updated_at") or "")[:10],
-                    "owner_avatar": repo.get("owner", {}).get("avatar_url", ""),
-                })
-    except Exception:
-        pass
-
-    # 4b. Code search for secrets
-    _se("osint_status", {"status": "running", "msg": "Buscando secretos en codigo..."})
-    secret_queries = [
-        ("API Keys / Tokens", f'"{domain}" password OR api_key OR apikey OR secret OR token OR bearer'),
-        ("Config Files", f'"{domain}" filename:.env OR filename:.yml OR filename:.config OR filename:.ini'),
-        ("AWS Credentials", f'"{domain}" AKIA OR aws_secret_access_key OR AWS_ACCESS_KEY'),
-        ("Private Keys", f'"{domain}" "BEGIN RSA PRIVATE KEY" OR "BEGIN EC PRIVATE KEY" OR "BEGIN OPENSSH"'),
-        ("DB Connections", f'"{domain}" mysql:// OR postgres:// OR mongodb:// OR redis://'),
-        ("OAuth / JWT", f'"{domain}" client_secret OR client_id OR jwt OR oauth'),
-        ("Hardcoded Creds", f'"{domain}" password= OR passwd= OR pwd= OR credentials'),
-        ("Internal URLs", f'"{domain}" staging OR internal OR dev OR localhost OR 127.0.0.1'),
-    ]
-    for label, query in secret_queries:
-        try:
-            code_resp = requests.get(
-                f"https://api.github.com/search/code?q={requests.utils.quote(query)}&per_page=5",
-                headers=gh_headers, timeout=10)
-            if code_resp.status_code == 200:
-                code_data = code_resp.json()
-                total = code_data.get("total_count", 0)
-                items = []
-                for item in code_data.get("items", []):
-                    items.append({
-                        "file": item.get("name", ""),
-                        "path": item.get("path", ""),
-                        "repo": item.get("repository", {}).get("full_name", ""),
-                        "url": item.get("html_url", ""),
-                    })
-                if total > 0:
-                    results["gh_code"].append({
-                        "label": label,
-                        "query": query,
-                        "total": total,
-                        "items": items,
-                        "search_url": f"https://github.com/search?q={requests.utils.quote(query)}&type=code",
-                    })
-            time.sleep(2)
-        except Exception:
-            pass
-
-    # 4c. Gists mentioning the domain
-    _se("osint_status", {"status": "running", "msg": "Buscando en GitHub Gists..."})
-    try:
-        gist_resp = requests.get(
-            f"https://api.github.com/search/code?q={requests.utils.quote(domain)}+in:file+language:text&per_page=10",
-            headers=gh_headers, timeout=10)
-        if gist_resp.status_code == 200:
-            for item in gist_resp.json().get("items", []):
-                repo_name = item.get("repository", {}).get("full_name", "")
-                if "gist" in repo_name.lower() or "snippet" in repo_name.lower():
-                    results["gh_gists"].append({
-                        "file": item.get("name", ""),
-                        "repo": repo_name,
-                        "url": item.get("html_url", ""),
-                    })
-    except Exception:
-        pass
-
-    # 4d. Descubrimiento de codigo fuente (dev -> repo -> secretos/RLS)
-    _se("osint_status", {"status": "running", "msg": "Descubriendo codigo fuente (dev -> repo)..."})
+    # Descubrimiento de codigo fuente: pagina -> desarrollador -> repo -> secretos/RLS
     try:
         results["source_repo"] = discover_source_repo(
             domain, html_out, resp_headers, gh_headers,
@@ -1285,46 +1130,8 @@ def run_osint(domain, sid=None):
     except Exception:
         results["source_repo"] = {}
 
-    # 5. Google Dorks
-    _se("osint_status", {"status": "running", "msg": "Generando Google Dorks..."})
-    dorks = [
-        ("Archivos Sensibles", f'site:{domain} (filetype:pdf OR filetype:doc OR filetype:xls OR filetype:sql OR filetype:env OR filetype:log OR filetype:bak)'),
-        ("Paginas de Login", f'site:{domain} (inurl:login OR inurl:signin OR inurl:auth OR inurl:admin)'),
-        ("Directorios Expuestos", f'site:{domain} intitle:"index of"'),
-        ("Archivos de Config", f'site:{domain} (filetype:xml OR filetype:json OR filetype:yml OR filetype:conf OR filetype:ini OR filetype:env)'),
-        ("Errores y Debug", f'site:{domain} (intext:"error" OR intext:"warning" OR intext:"debug" OR intext:"stack trace")'),
-        ("Passwords Expuestos", f'site:{domain} (intext:"password" OR intext:"passwd" OR intext:"credentials" OR filetype:sql)'),
-        ("Paneles de Admin", f'site:{domain} (inurl:admin OR inurl:panel OR inurl:dashboard OR inurl:manage OR inurl:console)'),
-        ("APIs Expuestas", f'site:{domain} (inurl:api OR inurl:v1 OR inurl:v2 OR inurl:graphql OR inurl:swagger OR inurl:rest)'),
-        ("Backups", f'site:{domain} (filetype:bak OR filetype:old OR filetype:backup OR filetype:zip OR filetype:tar OR filetype:gz)'),
-        ("Info en Pastebin", f'site:pastebin.com "{domain}"'),
-        ("Info en GitHub", f'site:github.com "{domain}" (password OR secret OR api_key OR token)'),
-        ("Subdominios Google", f'site:*.{domain} -www'),
-        ("Camaras y IoT", f'site:{domain} (inurl:cgi-bin OR inurl:webcam OR inurl:view.shtml)'),
-        ("Archivos Git", f'site:{domain} (inurl:.git OR inurl:.svn OR inurl:.env OR inurl:wp-config)'),
-        ("S3 Buckets", f'site:s3.amazonaws.com "{domain}"'),
-        ("Trello Boards", f'site:trello.com "{domain}"'),
-    ]
-    for name, query in dorks:
-        google_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
-        results["gdorks"].append({"name": name, "query": query, "link": google_url})
-
-    # 5. GitHub Dorks
-    github_dorks = [
-        ("Passwords", f'"{domain}" password OR passwd OR pwd'),
-        ("API Keys", f'"{domain}" api_key OR apikey OR api_secret OR access_key'),
-        ("Tokens", f'"{domain}" token OR bearer OR auth_token OR secret_key'),
-        ("Configs", f'"{domain}" filename:.env OR filename:.yml OR filename:config'),
-        ("AWS Keys", f'"{domain}" AKIA OR aws_secret'),
-        ("DB Credentials", f'"{domain}" database OR mysql OR postgres OR mongodb AND password'),
-        ("Private Keys", f'"{domain}" "BEGIN RSA PRIVATE KEY" OR "BEGIN EC PRIVATE KEY"'),
-    ]
-    for name, query in github_dorks:
-        gh_url = f"https://github.com/search?q={requests.utils.quote(query)}&type=code"
-        results["gitdorks"].append({"name": name, "query": query, "link": gh_url})
-
     _se("osint_result", results)
-    _se("osint_status", {"status": "done", "msg": "OSINT completado"})
+    _se("osint_status", {"status": "done", "msg": "Analisis completado"})
 
 
 @socketio.on("start_osint")
