@@ -1655,12 +1655,77 @@ def _check_platform(platform, username, results_list, session):
         pass
 
 
+def github_deep_profile(username):
+    """Perfil profundo de un usuario de GitHub: datos del perfil, emails REALES
+    extraidos de los commits de sus repos (deanonimizacion) y llaves SSH/GPG."""
+    h = {"Accept": "application/vnd.github.v3+json", "User-Agent": "Sharingan-OSINT"}
+    try:
+        gh_cmd = str(SCOOP_SHIMS / "gh.exe") if (SCOOP_SHIMS / "gh.exe").exists() else "gh"
+        tok = subprocess.check_output([gh_cmd, "auth", "token"], stderr=subprocess.DEVNULL, text=True).strip()
+        if tok:
+            h["Authorization"] = f"token {tok}"
+    except Exception:
+        pass
+
+    prof = {"found": False, "profile": {}, "emails": [], "names": [],
+            "ssh_keys": 0, "gpg": False, "top_repos": []}
+    try:
+        r = requests.get(f"https://api.github.com/users/{username}", headers=h, timeout=10)
+        if r.status_code != 200:
+            return prof
+        d = r.json()
+        prof["found"] = True
+        prof["profile"] = {k: d.get(k) for k in (
+            "name", "email", "bio", "company", "location", "blog",
+            "twitter_username", "public_repos", "followers", "following",
+            "created_at", "updated_at", "hireable")}
+
+        rr = requests.get(f"https://api.github.com/users/{username}/repos?per_page=100&sort=pushed",
+                          headers=h, timeout=10)
+        repos = [x.get("name") for x in rr.json()] if rr.status_code == 200 and isinstance(rr.json(), list) else []
+        prof["top_repos"] = repos[:12]
+
+        # Emails reales desde los commits (clave para deanonimizar)
+        emails = {}
+        for repo in repos[:12]:
+            try:
+                cc = requests.get(f"https://api.github.com/repos/{username}/{repo}/commits?per_page=30",
+                                  headers=h, timeout=10)
+                if cc.status_code == 200 and isinstance(cc.json(), list):
+                    for c in cc.json():
+                        a = (c.get("commit") or {}).get("author") or {}
+                        e, n = a.get("email", ""), a.get("name", "")
+                        if e and "noreply" not in e and "users.github.com" not in e and e not in emails:
+                            emails[e] = n
+            except Exception:
+                pass
+        prof["emails"] = [{"email": e, "name": n} for e, n in emails.items()]
+        prof["names"] = sorted({n for n in emails.values() if n})
+
+        # Llaves publicas SSH / GPG
+        try:
+            k = requests.get(f"https://github.com/{username}.keys", timeout=8)
+            if k.status_code == 200 and k.text.strip():
+                prof["ssh_keys"] = len([l for l in k.text.splitlines() if l.strip()])
+        except Exception:
+            pass
+        try:
+            g = requests.get(f"https://github.com/{username}.gpg", timeout=8)
+            if g.status_code == 200 and "PGP" in g.text:
+                prof["gpg"] = True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return prof
+
+
 def run_user_osint(query, mode, sid=None):
     def _se(ev, d):
         socketio.emit(ev, d, room=sid)
 
     results = {"query": query, "mode": mode, "found": [], "breaches": [], "emails_from_username": [],
-               "dorks": [], "total_checked": 0}
+               "dorks": [], "total_checked": 0, "github_profile": {}}
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
@@ -1685,6 +1750,15 @@ def run_user_osint(query, mode, sid=None):
 
         results["found"] = sorted(found_list, key=lambda x: x["platform"])
         results["total_checked"] = len(PLATFORM_CHECKS)
+
+        # ── Perfil profundo de GitHub (deanonimizacion via commits) ──
+        _se("user_osint_status", {"status": "running", "msg": "Perfilando usuario en GitHub (emails de commits)..."})
+        gh_prof = github_deep_profile(query)
+        results["github_profile"] = gh_prof
+        for em in gh_prof.get("emails", []):
+            entry = {"email": em["email"], "source": "GitHub commits", "name": em.get("name", "")}
+            if entry not in results["emails_from_username"]:
+                results["emails_from_username"].append(entry)
 
         _se("user_osint_status", {"status": "running", "msg": "Generando dorks de usuario..."})
         user_dorks = [

@@ -1367,6 +1367,49 @@ socket.on('user_osint_result', data => {
   }
   html += '</div>';
 
+  // GitHub deep profile (deanonimizacion)
+  const gp = data.github_profile || {};
+  if (gp.found) {
+    const p = gp.profile || {};
+    html += `<div style="margin-bottom:18px;background:var(--bg2);border:1px solid #3b82f655;border-radius:10px;padding:14px 16px">
+      <h3 style="color:#3b82f6;margin-bottom:8px;font-size:.95rem">🐙 Perfil GitHub — deanonimización</h3>`;
+    const chips = [];
+    if (p.name) chips.push(`👤 ${esc(p.name)}`);
+    if (p.company) chips.push(`🏢 ${esc(p.company)}`);
+    if (p.location) chips.push(`📍 ${esc(p.location)}`);
+    if (p.blog) chips.push(`🔗 ${esc(p.blog)}`);
+    if (p.twitter_username) chips.push(`🐦 @${esc(p.twitter_username)}`);
+    if (p.email) chips.push(`✉️ ${esc(p.email)}`);
+    if (p.public_repos != null) chips.push(`📦 ${p.public_repos} repos`);
+    if (p.created_at) chips.push(`🗓 ${esc((p.created_at||'').slice(0,10))}`);
+    if (chips.length) {
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">';
+      chips.forEach(c => { html += `<span style="background:var(--bg1);border-radius:4px;padding:3px 9px;font-size:.73rem;color:var(--text2)">${c}</span>`; });
+      html += '</div>';
+    }
+    if (p.bio) html += `<div style="font-size:.74rem;color:var(--text3);font-style:italic;margin-bottom:10px">${esc(p.bio)}</div>`;
+    if (gp.emails && gp.emails.length) {
+      html += `<div style="color:#ef4444;font-size:.8rem;font-weight:600;margin-bottom:5px">✉️ Emails reales (extraídos de commits) — ${gp.emails.length}</div><div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px">`;
+      gp.emails.forEach(em => {
+        html += `<div style="background:var(--bg1);border:1px solid #ef444433;border-radius:6px;padding:6px 10px;font-family:monospace;font-size:.76rem;color:#ef4444">${esc(em.email)}${em.name?` <span style="color:var(--text3)">(${esc(em.name)})</span>`:''}</div>`;
+      });
+      html += '</div>';
+    }
+    const kchips = [];
+    if (gp.ssh_keys) kchips.push(`🔑 ${gp.ssh_keys} llave(s) SSH pública(s)`);
+    if (gp.gpg) kchips.push(`🔏 GPG pública`);
+    if (gp.names && gp.names.length) kchips.push(`🧑 nombres: ${gp.names.map(esc).join(', ')}`);
+    if (kchips.length) {
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">';
+      kchips.forEach(c => { html += `<span style="background:var(--bg1);border-radius:4px;padding:3px 9px;font-size:.72rem;color:var(--text2)">${c}</span>`; });
+      html += '</div>';
+    }
+    if (gp.top_repos && gp.top_repos.length) {
+      html += `<div style="font-size:.7rem;color:var(--text3)">Repos: ${gp.top_repos.map(esc).join(', ')}</div>`;
+    }
+    html += '</div>';
+  }
+
   // Platforms found by category
   if (data.found.length) {
     const catNames = {social:'Redes Sociales',dev:'Desarrollo',gaming:'Gaming',security:'Seguridad',blog:'Blogs',software:'Software',shopping:'Shopping / Servicios',other:'Otros'};
