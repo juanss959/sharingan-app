@@ -845,6 +845,39 @@ socket.on('phase_status', data => {
   else if (data.status === 'done') addLog(`Fase ${data.phase}: ${phaseNames[data.phase]} completada`, true);
 });
 
+// Actualiza los badges del sidebar EN VIVO a medida que cada fase reporta conteos.
+let _statsInfoFetched = false;
+socket.on('stats_update', data => {
+  if (data.scan_id !== currentScanId) return;
+  const map = { subdomains:'subs', alive:'hosts', ports:'ports', vulns:'vulns', dirs:'dirs', urls:'urls' };
+  for (const [k, mod] of Object.entries(map)) {
+    if (typeof data[k] === 'number') {
+      const b = document.querySelector(`.nav-item[data-mod="${mod}"] .badge`);
+      if (b) b.textContent = data[k];
+    }
+  }
+  // Fase 1 (recon): los conteos de tech/whois/dns/security/ssl/js_secrets no vienen
+  // en el payload; se refrescan una sola vez con un fetch liviano.
+  if (data.info && !_statsInfoFetched) {
+    _statsInfoFetched = true;
+    fetch(`/api/scans/${currentScanId}`).then(r => r.json()).then(scan => {
+      if (!scan || scan.error) return;
+      const info = scan.recon_info || {};
+      const c = {
+        tech:(info.tech||[]).length, whois:(info.whois||[]).length, dns:(info.dns||[]).length,
+        security:(info.security||[]).length, ssl:(info.ssl||[]).length,
+        js_secrets:(info.js_secrets||[]).filter(r => r.key !== 'JS Files Analizados').length,
+      };
+      Object.entries(c).forEach(([mod, n]) => {
+        const b = document.querySelector(`.nav-item[data-mod="${mod}"] .badge`);
+        if (b) b.textContent = n;
+      });
+    }).catch(() => {});
+  }
+});
+
+socket.on('scan_started', () => { _statsInfoFetched = false; });
+
 socket.on('scan_done', data => {
   if (data.scan_id !== currentScanId) return;
   addLog('Scan completado!', true);
