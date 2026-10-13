@@ -846,23 +846,269 @@ try {{ $r = Resolve-DnsName $d -Type SOA -EA Stop; $s = $r | Where-Object {{ $_.
 
 # ── Standalone OSINT ──
 
+def _slug_tokens(text):
+    out = []
+    for t in re.findall(r'[A-Za-z0-9][A-Za-z0-9\-]{1,38}', text or ''):
+        if t.lower() in ('com','www','net','org','the','and','por','web','inc','llc',
+                          'studio','agency','agencia','sitio','page','pagina'):
+            continue
+        out.append(t)
+    return out
+
+
+def discover_source_repo(domain, html_out, resp_headers, gh_headers, emit_status=None):
+    """De la URL al repositorio: atribucion del dev -> enumerar sus repos ->
+    confirmar match por identificador unico -> escanear secretos/credenciales por
+    defecto y RLS. Devuelve dict con attribution/fingerprint/candidate_owners/matches/leaks."""
+    def _st(msg):
+        if emit_status:
+            emit_status(msg)
+
+    res = {"attribution": [], "fingerprint": [], "candidate_owners": [], "matches": [], "leaks": []}
+    html = html_out or ""
+    try:
+        brand = domain.split(":")[0].split("/")[0]
+        brand = brand[4:] if brand.startswith("www.") else brand
+        brand_token = brand.split(".")[0]
+    except Exception:
+        brand_token = domain
+
+    # 1. Atribucion (quien desarrollo la web)
+    for m in re.finditer(
+            r'(?:desarrollad[oa]\s+por|hecho\s+por|powered\s+by|developed\s+by|built\s+by|'
+            r'dise[nñ]ad[oa]\s+por|creado\s+por)\s*[:\-]?\s*([^<\n,|]{2,40})', html, re.IGNORECASE):
+        val = re.sub(r'\s+', ' ', m.group(1)).strip(" .:-|")
+        if len(val) >= 2:
+            res["attribution"].append({"type": "Desarrollado por", "value": val[:60]})
+    for key, pat in [("author", r'<meta\s+name=["\']author["\']\s+content=["\']([^"\']+)'),
+                     ("creator", r'<meta\s+name=["\']creator["\']\s+content=["\']([^"\']+)'),
+                     ("generator", r'<meta\s+name=["\']generator["\']\s+content=["\']([^"\']+)')]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            res["attribution"].append({"type": "meta:" + key, "value": m.group(1).strip()[:60]})
+    for m in re.finditer(r'/(?:images?/partners?|clients?|img/partners?)/([A-Za-z0-9._\-]+?)\.(?:png|jpe?g|svg|webp)',
+                         html, re.IGNORECASE):
+        res["attribution"].append({"type": "partner-img", "value": m.group(1)})
+
+    # Fingerprint (stack -> orienta la busqueda)
+    try:
+        hdr = {k.lower(): v for k, v in (resp_headers or {}).items()}
+        for k in ("server", "x-powered-by"):
+            if hdr.get(k):
+                res["fingerprint"].append({"key": k, "value": hdr[k][:60]})
+        if any(k.startswith("x-nextjs") or k.startswith("x-vercel") for k in hdr):
+            res["fingerprint"].append({"key": "framework", "value": "Next.js / Vercel"})
+    except Exception:
+        pass
+    for ref in set(re.findall(r'([a-z0-9]{15,25})\.supabase\.co', html)):
+        res["fingerprint"].append({"key": "supabase", "value": ref + ".supabase.co"})
+
+    # 2. Semillas (tokens) para encontrar al desarrollador: owners de GitHub en la
+    #    pagina, la AGENCIA del credito del footer (link), tokens de atribucion y la marca.
+    bad = {"sponsors","features","about","topics","orgs","login","marketplace","pricing",
+           "readme","explore","site","apps","collections","events","settings","search","new"}
+    seeds = []
+    for m in re.finditer(r'github\.com/([A-Za-z0-9][A-Za-z0-9\-]{0,38})', html, re.IGNORECASE):
+        if m.group(1).lower() not in bad:
+            seeds.append(m.group(1))
+    # Agencia desde el link del credito ("Desarrollado por ... href=https://agencia.com")
+    m = re.search(r'(?:desarrollad[oa]\s+por|powered\s+by|hecho\s+por|developed\s+by|'
+                  r'dise[nñ]ad[oa]\s+por|creado\s+por)[\s\S]{0,160}?href=["\']https?://(?:www\.)?'
+                  r'([a-z0-9\-]{3,})\.[a-z0-9.\-]+', html, re.IGNORECASE)
+    if m:
+        seeds.append(m.group(1))
+        res["attribution"].append({"type": "agencia(link)", "value": m.group(1)})
+    for a in res["attribution"]:
+        seeds += _slug_tokens(a["value"])
+    seeds.append(brand_token)
+    sset, seed_list = set(), []
+    for s in seeds:
+        if len(s) >= 3 and s.lower() not in sset:
+            sset.add(s.lower()); seed_list.append(s)
+    seed_list = seed_list[:8]
+
+    # 3. Descubrir owners REALES: por cada semilla, buscar repos y tomar sus owners
+    #    (doble salto: marca/agencia -> repo -> owner -> todos los repos del owner).
+    _st("Buscando desarrolladores/organizaciones en GitHub...")
+    owners = list(seed_list)
+    for token in seed_list:
+        try:
+            sr = requests.get(f"https://api.github.com/search/repositories?q={requests.utils.quote(token)}&per_page=8",
+                              headers=gh_headers, timeout=10)
+            if sr.status_code == 200:
+                for r in sr.json().get("items", []):
+                    o = r.get("owner", {}).get("login", "")
+                    if o and o.lower() not in {x.lower() for x in owners}:
+                        owners.append(o)
+        except Exception:
+            pass
+    owners = owners[:10]
+    res["candidate_owners"] = owners
+
+    # 3b. Enumerar TODOS los repos de los owners candidatos
+    _st("Enumerando repos de los desarrolladores candidatos...")
+    repos = {}
+    def _add(r):
+        fn = r.get("full_name", "")
+        if fn and fn not in repos:
+            repos[fn] = {"name": fn, "url": r.get("html_url", ""),
+                         "language": r.get("language") or "", "updated": (r.get("updated_at") or "")[:10],
+                         "default_branch": r.get("default_branch", "main")}
+    for owner in owners:
+        for kind in ("users", "orgs"):
+            try:
+                rr = requests.get(f"https://api.github.com/{kind}/{owner}/repos?per_page=60&sort=updated",
+                                  headers=gh_headers, timeout=10)
+                if rr.status_code == 200:
+                    for r in rr.json():
+                        _add(r)
+                    break
+            except Exception:
+                pass
+
+    # 4a. GitHub code search por la marca, PERO solo archivos que parecen codigo de app
+    #     (evita basura como listas de dominios). Marca estos repos como prioritarios.
+    _st("Buscando el identificador de la marca en codigo (GitHub)...")
+    bt = brand_token.lower()
+    owner_set = {o.lower() for o in owners}
+    src_path = re.compile(
+        r'(^|/)(app|src|supabase|lib|components|pages|server|db|migrations)/|'
+        r'\.(sql|ts|tsx|js|jsx|env|prisma|py|astro|vue|svelte)$|package\.json$|next\.config',
+        re.IGNORECASE)
+    priority = set()
+    try:
+        cs = requests.get(f"https://api.github.com/search/code?q={requests.utils.quote(brand_token)}&per_page=20",
+                          headers=gh_headers, timeout=12)
+        if cs.status_code == 200:
+            for item in cs.json().get("items", []):
+                rp = item.get("repository", {})
+                fn = rp.get("full_name", "")
+                path = item.get("path", "")
+                if not fn:
+                    continue
+                # aceptar solo si el owner es candidato o el path parece codigo de app
+                if fn.split("/")[0].lower() not in owner_set and not src_path.search(path):
+                    continue
+                priority.add(fn)
+                if fn not in repos:
+                    repos[fn] = {"name": fn, "url": rp.get("html_url", ""), "language": "",
+                                 "updated": "", "default_branch": rp.get("default_branch", "main")}
+                repos[fn].setdefault("_codehit", path)
+    except Exception:
+        pass
+
+    # 4b. Confirmar: repos de owners candidatos PRIMERO, luego code-hits, luego resto.
+    _st("Confirmando repositorio por identificadores unicos...")
+    def _rank(fn):
+        return (0 if fn.split("/")[0].lower() in owner_set else 1, 0 if fn in priority else 1)
+    ordered = sorted(repos.keys(), key=_rank)
+    checked = 0
+    for fn in ordered:
+        if len(res["matches"]) >= 6 or checked >= 35:
+            break
+        meta = repos[fn]
+        why = []
+        if fn.split("/")[0].lower() in owner_set:
+            why.append("repo del desarrollador candidato")
+        if fn in priority:
+            why.append(f"code search '{brand_token}'" + (f" → {meta['_codehit']}" if meta.get("_codehit") else ""))
+        if bt and bt in fn.lower():
+            why.append(f"nombre contiene '{brand_token}'")
+        try:
+            tr = requests.get(f"https://api.github.com/repos/{fn}/git/trees/{meta['default_branch']}?recursive=1",
+                              headers=gh_headers, timeout=12)
+            checked += 1
+            if tr.status_code == 200:
+                paths = [t.get("path", "") for t in tr.json().get("tree", []) if t.get("type") == "blob"]
+                meta["_paths"] = paths
+                hits = [p for p in paths if bt and bt in p.lower()]
+                if hits:
+                    why.append(f"archivo con '{brand_token}': {hits[0]}")
+        except Exception:
+            pass
+        # exigir una senal fuerte: match por archivo/code-hit/nombre (no solo "repo del dev")
+        strong = any(("archivo con" in w) or ("code search" in w) or ("nombre contiene" in w) for w in why)
+        if strong:
+            meta["why"] = "; ".join(why)
+            res["matches"].append({k: meta.get(k, "") for k in ("name", "url", "language", "updated", "why")})
+
+    # 5. Escaneo de secretos / credenciales por defecto / RLS en los matches top
+    _st("Escaneando secretos y credenciales por defecto...")
+    import base64 as _b64
+    cred_pat = re.compile(
+        r'(ADMIN_PASSWORD|ADMIN_EMAIL|ADMIN_SESSION_SECRET|SESSION_SECRET|JWT_SECRET|API_KEY|'
+        r'SECRET_KEY|SERVICE_ROLE_KEY|PASSWORD|TOKEN)\s*(?:=|\?\?|\|\|)\s*["\']([^"\']{3,})["\']',
+        re.IGNORECASE)
+    for match in res["matches"][:3]:
+        fn = match["name"]
+        paths = repos.get(fn, {}).get("_paths", [])
+        cand_files = [p for p in paths if re.search(
+            r'(\.env(\.example)?$|super-?admin|session|credential|service-?role|(^|/)auth|'
+            r'admin.*(auth|action)|supabase/.*\.sql$|middleware|roles?\.(ts|js)|next\.config)',
+            p, re.IGNORECASE)]
+        def _fscore(p):
+            pl = p.lower()
+            if re.search(r'(super-?admin|session|credential|service-?role|\.env)', pl): return 0
+            if re.search(r'(admin.*(auth|action)|/auth/|roles?\.)', pl): return 1
+            if pl.endswith('.sql'): return 2
+            return 3
+        cand_files.sort(key=_fscore)
+        want = cand_files[:12]
+        branch = repos.get(fn, {}).get("default_branch", "main")
+        for p in want:
+            content = ""
+            enc_path = "/".join(requests.utils.quote(seg) for seg in p.split("/"))
+            for br in (branch, "main", "master"):
+                try:
+                    rr = requests.get(f"https://raw.githubusercontent.com/{fn}/{br}/{enc_path}", timeout=10)
+                    if rr.status_code == 200:
+                        content = rr.text
+                        break
+                except Exception:
+                    pass
+            if not content:
+                continue
+            for mm in cred_pat.finditer(content):
+                rhs = mm.group(2)
+                if rhs.lower() in ("", "process", "your_", "changeme") or rhs.startswith("$"):
+                    continue
+                res["leaks"].append({"repo": fn, "file": p, "sev": "alto",
+                                     "type": "Credencial/secreto por defecto hardcodeado",
+                                     "snippet": mm.group(0)[:120]})
+            if "service_role" in content or "sb_secret_" in content:
+                res["leaks"].append({"repo": fn, "file": p, "sev": "medio",
+                                     "type": "Referencia a service_role / secret key", "snippet": "service_role / sb_secret_"})
+            if re.search(r"raw_user_meta_data\s*->>\s*'role'", content):
+                res["leaks"].append({"repo": fn, "file": p, "sev": "alto",
+                                     "type": "Posible privesc: rol derivado de user_metadata en trigger",
+                                     "snippet": "raw_user_meta_data->>'role'"})
+            for rls in re.finditer(r'(using|with check)\s*\(\s*true\s*\)', content, re.IGNORECASE):
+                res["leaks"].append({"repo": fn, "file": p, "sev": "medio",
+                                     "type": "RLS permisiva", "snippet": rls.group(0)})
+            time.sleep(0.4)
+    return res
+
+
 def run_osint(domain, sid=None):
     def _se(ev, d):
         socketio.emit(ev, d, room=sid)
 
     results = {"emails": [], "social": [], "meta": [], "wayback": [], "wayback_total": 0,
-               "gdorks": [], "gitdorks": [], "gh_repos": [], "gh_code": [], "gh_gists": []}
+               "gdorks": [], "gitdorks": [], "gh_repos": [], "gh_code": [], "gh_gists": [],
+               "source_repo": {}}
 
     _se("osint_status", {"status": "running", "msg": "Descargando pagina..."})
 
     # Fetch HTML
     html_out = ""
     base = ""
+    resp_headers = {}
     for scheme in ["https", "http"]:
         try:
             url = f"{scheme}://{domain}"
             resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, verify=False)
             html_out = resp.text
+            resp_headers = dict(resp.headers)
             base = url
             break
         except Exception:
@@ -1029,6 +1275,15 @@ def run_osint(domain, sid=None):
                     })
     except Exception:
         pass
+
+    # 4d. Descubrimiento de codigo fuente (dev -> repo -> secretos/RLS)
+    _se("osint_status", {"status": "running", "msg": "Descubriendo codigo fuente (dev -> repo)..."})
+    try:
+        results["source_repo"] = discover_source_repo(
+            domain, html_out, resp_headers, gh_headers,
+            emit_status=lambda m: _se("osint_status", {"status": "running", "msg": m}))
+    except Exception:
+        results["source_repo"] = {}
 
     # 5. Google Dorks
     _se("osint_status", {"status": "running", "msg": "Generando Google Dorks..."})

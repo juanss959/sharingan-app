@@ -1287,6 +1287,52 @@ socket.on('osint_result', data => {
   }
   html += '</div>';
 
+  // Source code discovery (dev -> repo -> secretos/RLS)
+  const sr = data.source_repo || {};
+  if ((sr.matches && sr.matches.length) || (sr.attribution && sr.attribution.length) || (sr.leaks && sr.leaks.length) || (sr.fingerprint && sr.fingerprint.length)) {
+    html += `<div style="margin-bottom:20px">
+      <h3 style="color:#f59e0b;margin-bottom:4px">🔎 Código Fuente Descubierto</h3>
+      <div style="color:var(--text3);font-size:.75rem;margin-bottom:10px">De la URL al repositorio: atribución del dev → enumerar repos → confirmar por identificador único → secretos/RLS</div>`;
+    const chips = [];
+    (sr.fingerprint||[]).forEach(f => chips.push(`${esc(f.key)}: ${esc(f.value)}`));
+    (sr.attribution||[]).forEach(a => chips.push(`${esc(a.type)}: ${esc(a.value)}`));
+    if (chips.length) {
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">';
+      chips.forEach(c => { html += `<span style="background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:.72rem;color:var(--text2)">${c}</span>`; });
+      html += '</div>';
+    }
+    if (sr.matches && sr.matches.length) {
+      html += `<div style="color:#22c55e;font-size:.78rem;font-weight:600;margin-bottom:6px">✓ Repositorio(s) confirmado(s) (${sr.matches.length})</div><div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px">`;
+      sr.matches.forEach(r => {
+        html += `<div style="background:var(--bg2);border:1px solid #22c55e55;border-radius:8px;padding:10px 14px">
+          <a href="${esc(r.url)}" target="_blank" style="color:#22c55e;font-weight:600;font-size:.85rem;text-decoration:none">${esc(r.name)}</a>
+          ${r.language?`<span style="background:#22c55e22;color:#22c55e;font-size:.65rem;padding:2px 6px;border-radius:4px;margin-left:6px">${esc(r.language)}</span>`:''}
+          <div style="color:var(--text3);font-size:.72rem;margin-top:3px">Match: ${esc(r.why)}</div>
+          <div style="color:var(--text3);font-size:.68rem;margin-top:2px">Actualizado: ${esc(r.updated)}</div>
+        </div>`;
+      });
+      html += '</div>';
+    } else {
+      html += '<div style="color:var(--text3);font-size:.8rem;margin-bottom:8px">No se confirmó un repositorio público (puede ser privado).</div>';
+    }
+    if (sr.leaks && sr.leaks.length) {
+      html += `<div style="color:#ef4444;font-size:.78rem;font-weight:600;margin-bottom:6px">🔓 Secretos / config peligrosa en el código (${sr.leaks.length})</div><div style="display:flex;flex-direction:column;gap:5px">`;
+      sr.leaks.forEach(l => {
+        const col = l.sev==='alto' ? '#ef4444' : '#f59e0b';
+        html += `<div style="background:var(--bg2);border:1px solid ${col}44;border-radius:8px;padding:8px 12px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+            <span style="background:${col}22;color:${col};font-size:.62rem;padding:2px 7px;border-radius:4px;font-weight:600;text-transform:uppercase">${esc(l.sev||'')}</span>
+            <span style="color:var(--text1);font-size:.8rem;font-weight:600">${esc(l.type)}</span>
+          </div>
+          <div style="color:var(--text3);font-size:.72rem">${esc(l.repo)} / ${esc(l.file)}</div>
+          <div style="font-family:monospace;font-size:.7rem;color:${col};margin-top:3px;word-break:break-all">${esc(l.snippet)}</div>
+        </div>`;
+      });
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
   // GitHub Repos
   if (data.gh_repos && data.gh_repos.length) {
     html += `<div style="margin-bottom:20px">
