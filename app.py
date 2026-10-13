@@ -2402,8 +2402,10 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
         if emit_live:
             socketio.emit(ev, payload, room=sid)
 
-    sid = _threading.get_ident()
-    active_fuzz[sid] = "running"
+    # tid identifica el hilo para la cancelacion (active_fuzz); sid es el socket
+    # del cliente que lanzo el fuzz y se usa SOLO para emitir al room correcto.
+    tid = _threading.get_ident()
+    active_fuzz[tid] = "running"
     results = {"found": [], "total_requests": 0, "method": "", "filtered_count": 0,
                "waf": None, "stack": None, "scan_id": scan_id}
 
@@ -2515,7 +2517,22 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
                     fp = (r.get("status", 0), r.get("words", 0), r.get("lines", 0))
                     fp_counts[fp] = fp_counts.get(fp, 0) + 1
                 catchall_fps = {fp for fp, c in fp_counts.items()
-                                if c > 200 or (c > 20 and total_raw and c / total_raw > 0.15)}
+                                if c > 200 or (c > 20 and total_raw and c / total_raw > 0.15)
+                                or (total_raw >= 5 and c / total_raw >= 0.8)}
+                # Aviso si el target responde casi siempre lo mismo (WAF / rate-limit / catch-all)
+                if total_raw >= 5:
+                    dom_status, dom_c = None, 0
+                    st_counts = {}
+                    for r in raw:
+                        s = r.get("status", 0)
+                        st_counts[s] = st_counts.get(s, 0) + 1
+                    for s, c in st_counts.items():
+                        if c > dom_c:
+                            dom_status, dom_c = s, c
+                    if dom_status in (401, 403, 429, 503) and dom_c / total_raw >= 0.8:
+                        emit("fuzz_status", {"status": "running",
+                             "msg": f"⚠ El objetivo respondió {dom_status} a casi todo "
+                                    f"({dom_c}/{total_raw}) — posible WAF/rate-limit; resultados filtrados como catch-all"})
 
                 filtered = 0
                 for r in raw:
@@ -2645,13 +2662,13 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
         visited_bases = {url}
 
         while bases:
-            if active_fuzz.get(sid) == "cancelled":
+            if active_fuzz.get(tid) == "cancelled":
                 break
             next_bases = []
             # Procesar las bases de esta profundidad, cada una concurrentemente.
             round_total = len(bases) * len(paths)
             for base, depth in bases:
-                if active_fuzz.get(sid) == "cancelled" or state["req"] >= REQ_BUDGET:
+                if active_fuzz.get(tid) == "cancelled" or state["req"] >= REQ_BUDGET:
                     break
                 bl = baselines.get(base)
                 if bl is None:
@@ -2775,7 +2792,7 @@ def run_fuzzing(url, extensions, threads, wordlist_path,
     if filt:
         done_msg += f" ({filt} descartados como catch-all)"
     emit("fuzz_status", {"status": "done", "msg": done_msg})
-    active_fuzz.pop(sid, None)
+    active_fuzz.pop(tid, None)
 
     try:
         _shutil.rmtree(tmpdir, ignore_errors=True)
